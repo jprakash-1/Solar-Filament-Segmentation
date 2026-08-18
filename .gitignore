@@ -1,0 +1,29 @@
+# Data
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+*.zip
+
+# Kaggle credentials
+kaggle.json
+.kaggle/
+.env
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Outputs
+outputs/checkpoints/*
+outputs/logs/*
+outputs/submissions/*
+!outputs/checkpoints/.gitkeep
+!outputs/logs/.gitkeep
+!outputs/submissions/.gitkeep
+
+# OS
+.DS_Store

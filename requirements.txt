@@ -1,0 +1,30 @@
+# Solar Filament Segmentation Challenge 2026 - dependencies
+# Core
+numpy
+pandas
+scipy
+opencv-python-headless
+Pillow
+scikit-image
+scikit-learn
+matplotlib
+seaborn
+tqdm
+
+# Deep learning (baseline stack left minimal per project decision;
+# segmentation_models_pytorch / timm can be added once approach is chosen)
+torch
+torchvision
+
+# Kaggle
+kaggle
+
+# Notebook
+jupyterlab
+ipykernel
+
+# Config / experiment tracking (optional, uncomment as needed)
+# pyyaml
+# mlflow
+# opik
+pyyaml
