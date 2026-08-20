@@ -34,9 +34,9 @@ loss:
 
 train:
   epochs: 40
-  batch_size: 8 # 2x T4 via nn.DataParallel (~4/GPU) at image_size 1024. nn.DataParallel gathers
+  batch_size: 12 # 2x T4 via nn.DataParallel (~6/GPU) at image_size 1024. nn.DataParallel gathers
   # outputs/grads onto GPU 0 and keeps the un-replicated master model + optimizer state there
-  # too, so GPU 0 OOMs before GPU 1; drop further to 4 if this OOMs.
+  # too, so GPU 0 OOMs before GPU 1; drop to 8 if this OOMs.
   lr: 3.0e-4
   weight_decay: 1.0e-4
   scheduler: cosine
