@@ -19,7 +19,7 @@ data:
   image_size: 1024 # downsized from native_size to fit T4 VRAM; postprocess/infer upsamples predictions back to native resolution
   native_size: 2048
   val_fraction: 0.1
-  num_workers: 4
+  num_workers: 6 # raised from 4 to keep both T4s fed; Kaggle GPU notebooks typically give ~4 vCPUs, so watch for CPU-bound contention if this doesn't help
 
 model:
   encoder_name: tu-convnext_tiny
