@@ -34,11 +34,9 @@ loss:
 
 train:
   epochs: 40
-  batch_size: 16 # 2x T4 via nn.DataParallel (~8/GPU) at image_size 1024 -- 4x the pixel budget
-  # of the old 2048px/batch_size=4 run, which left GPUs at ~4GB/15GB and 0% util (data/Python
-  # overhead bound, not compute bound). nn.DataParallel also gathers outputs/grads onto GPU 0
-  # and keeps the un-replicated master model + optimizer state there, so GPU 0 OOMs before GPU 1
-  # -- if this OOMs, drop to 12 then 8 before reverting image_size.
+  batch_size: 8 # 2x T4 via nn.DataParallel (~4/GPU) at image_size 1024. nn.DataParallel gathers
+  # outputs/grads onto GPU 0 and keeps the un-replicated master model + optimizer state there
+  # too, so GPU 0 OOMs before GPU 1; drop further to 4 if this OOMs.
   lr: 3.0e-4
   weight_decay: 1.0e-4
   scheduler: cosine
