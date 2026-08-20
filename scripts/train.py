@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -92,6 +93,10 @@ def main() -> None:
     )
 
     model = build_model(**model_cfg).to(device)
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs via nn.DataParallel")
+        model = nn.DataParallel(model)
+
     criterion = DiceBCELoss(**cfg["loss"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
 
@@ -171,11 +176,12 @@ def main() -> None:
             writer.writerow([epoch, train_loss, val_loss, val_iou, val_dice, val_dice_tm, lr_now, elapsed])
             log_file.flush()
 
-            torch.save({"model": model.state_dict(), "config": effective_cfg, "epoch": epoch}, checkpoint_dir / "last.pt")
+            model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            torch.save({"model": model_state, "config": effective_cfg, "epoch": epoch}, checkpoint_dir / "last.pt")
             if val_dice_tm > best_dice:
                 best_dice = val_dice_tm
                 torch.save(
-                    {"model": model.state_dict(), "config": effective_cfg, "epoch": epoch, "val_dice": best_dice},
+                    {"model": model_state, "config": effective_cfg, "epoch": epoch, "val_dice": best_dice},
                     checkpoint_dir / "best.pt",
                 )
                 print(f"  new best (val_dice={best_dice:.4f}) -> saved {checkpoint_dir / 'best.pt'}")

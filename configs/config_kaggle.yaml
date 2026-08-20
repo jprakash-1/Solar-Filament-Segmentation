@@ -33,7 +33,7 @@ loss:
 
 train:
   epochs: 40
-  batch_size: 4 # raise if VRAM allows (watch for OOM at 2048px); lower to 2 if it doesn't fit
+  batch_size: 8 # 2x T4 via nn.DataParallel (~4/GPU, same per-GPU load as the single-GPU default of 4); lower if OOM
   lr: 3.0e-4
   weight_decay: 1.0e-4
   scheduler: cosine
