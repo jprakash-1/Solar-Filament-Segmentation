@@ -11,10 +11,14 @@ matplotlib
 seaborn
 tqdm
 
-# Deep learning (baseline stack left minimal per project decision;
-# segmentation_models_pytorch / timm can be added once approach is chosen)
+# Deep learning
 torch
 torchvision
+segmentation-models-pytorch
+timm
+albumentations
+torchmetrics
+pycocotools
 
 # Kaggle
 kaggle
