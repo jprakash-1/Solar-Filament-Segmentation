@@ -34,7 +34,9 @@ loss:
 
 train:
   epochs: 40
-  batch_size: 8 # 2x T4 via nn.DataParallel (~4/GPU, same per-GPU load as the single-GPU default of 4); lower if OOM
+  batch_size: 4 # 2x T4 via nn.DataParallel (~2/GPU). nn.DataParallel gathers outputs/grads
+  # on GPU 0 and keeps the un-replicated master model + optimizer state there too, so GPU 0
+  # OOMs well before a plain single-GPU run at the same per-GPU batch would; raise cautiously.
   lr: 3.0e-4
   weight_decay: 1.0e-4
   scheduler: cosine
