@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=None, help="total batch size, split evenly across GPUs under torchrun")
     p.add_argument("--num-workers", type=int, default=None)
     p.add_argument("--debug-limit", type=int, default=None, help="cap train images (val capped to 1/5 of this) for a fast smoke test")
+    p.add_argument("--resume", action="store_true", help="resume from checkpoint_dir/last.pt if it exists")
     return p.parse_args()
 
 
@@ -145,7 +146,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
 
     epochs = args.epochs or cfg["train"]["epochs"]
-    warmup_epochs = cfg["train"]["warmup_epochs"]
+    warmup_epochs = min(cfg["train"]["warmup_epochs"], max(epochs - 1, 0))  # leave >=1 epoch for cosine decay
     if warmup_epochs > 0:
         warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
@@ -163,18 +164,46 @@ def main() -> None:
     early_stopping_patience = cfg["train"]["early_stopping_patience"]
     best_dice = -1.0
     epochs_without_improvement = 0
+    start_epoch = 1
     effective_cfg = {**cfg, "model": model_cfg}
+
+    if args.resume:
+        resume_path = checkpoint_dir / "last.pt"
+        if resume_path.exists():
+            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+            eval_model.load_state_dict(ckpt["model"])
+            if "optimizer" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                scaler.load_state_dict(ckpt["scaler"])
+            elif is_main:
+                print(f"  {resume_path} is an old-format checkpoint (weights only) -- optimizer restarts fresh")
+            best_dice = ckpt.get("best_dice", -1.0)
+            epochs_without_improvement = ckpt.get("epochs_without_improvement", 0)
+            start_epoch = ckpt["epoch"] + 1
+            # Rebuilding scheduler.state_dict() directly would restore the *previous* run's
+            # T_max/milestones (shaped for whatever --epochs it used), which silently breaks the
+            # LR curve if this run's --epochs differs. Replaying .step() re-derives the correct
+            # position against *this* run's schedule instead.
+            for _ in range(start_epoch - 1):
+                scheduler.step()
+            if is_main:
+                print(f"Resumed from {resume_path} (epoch {ckpt['epoch']}, best_dice={best_dice:.4f})")
+        elif is_main:
+            print(f"--resume passed but {resume_path} doesn't exist -- starting fresh")
 
     log_file = None
     writer = None
     if is_main:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = open(log_dir / "train_log.csv", "w", newline="")
+        log_path = log_dir / "train_log.csv"
+        resuming_log = start_epoch > 1 and log_path.exists()
+        log_file = open(log_path, "a" if resuming_log else "w", newline="")
         writer = csv.writer(log_file)
-        writer.writerow(["epoch", "train_loss", "val_loss", "val_iou", "val_dice", "val_dice_torchmetrics", "lr", "seconds"])
+        if not resuming_log:
+            writer.writerow(["epoch", "train_loss", "val_loss", "val_iou", "val_dice", "val_dice_torchmetrics", "lr", "seconds"])
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         t0 = time.time()
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -238,18 +267,26 @@ def main() -> None:
             writer.writerow([epoch, train_loss, val_loss, val_iou, val_dice, val_dice_tm, lr_now, elapsed])
             log_file.flush()
 
-            model_state = eval_model.state_dict()
-            torch.save({"model": model_state, "config": effective_cfg, "epoch": epoch}, checkpoint_dir / "last.pt")
-            if val_dice_tm > best_dice:
+            is_new_best = val_dice_tm > best_dice
+            if is_new_best:
                 best_dice = val_dice_tm
                 epochs_without_improvement = 0
-                torch.save(
-                    {"model": model_state, "config": effective_cfg, "epoch": epoch, "val_dice": best_dice},
-                    checkpoint_dir / "best.pt",
-                )
-                print(f"  new best (val_dice={best_dice:.4f}) -> saved {checkpoint_dir / 'best.pt'}")
             else:
                 epochs_without_improvement += 1
+
+            checkpoint_payload = {
+                "model": eval_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict(),
+                "config": effective_cfg,
+                "epoch": epoch,
+                "best_dice": best_dice,
+                "epochs_without_improvement": epochs_without_improvement,
+            }
+            torch.save(checkpoint_payload, checkpoint_dir / "last.pt")
+            if is_new_best:
+                torch.save({**checkpoint_payload, "val_dice": best_dice}, checkpoint_dir / "best.pt")
+                print(f"  new best (val_dice={best_dice:.4f}) -> saved {checkpoint_dir / 'best.pt'}")
 
             should_stop = epochs_without_improvement >= early_stopping_patience
             if should_stop:
