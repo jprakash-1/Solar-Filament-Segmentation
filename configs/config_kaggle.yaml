@@ -36,10 +36,10 @@ loss:
 
 train:
   epochs: 40
-  batch_size: 20 # 2x T4 via nn.DataParallel (~10/GPU) at image_size 768 (12 was tuned for the
-  # old image_size 1024, ~1.8x more pixels/image). nn.DataParallel gathers outputs/grads onto
-  # GPU 0 and keeps the un-replicated master model + optimizer state there too, so GPU 0 OOMs
-  # before GPU 1; drop to 16 then 12 if this OOMs.
+  batch_size: 20 # total across GPUs (split evenly per-rank under torchrun/DistributedDataParallel,
+  # e.g. ~10/GPU on 2x T4 at image_size 768). Unlike nn.DataParallel, DDP keeps memory balanced
+  # across ranks -- no single GPU carries extra master-model/optimizer overhead. Drop to 16 then
+  # 12 if any rank OOMs.
   lr: 3.0e-4
   weight_decay: 1.0e-4
   scheduler: cosine
