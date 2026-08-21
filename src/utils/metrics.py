@@ -26,7 +26,11 @@ class EpochDiceScore:
 
     def __init__(self, device: torch.device, threshold: float = 0.5) -> None:
         self.threshold = threshold
-        self.metric = DiceScore(num_classes=2, include_background=False, average="macro", input_format="index").to(device)
+        # sync_on_compute=False: this only ever runs on rank 0 under DDP (validation is rank-0-only),
+        # so compute() must not wait on a distributed all-gather the other ranks never join.
+        self.metric = DiceScore(
+            num_classes=2, include_background=False, average="macro", input_format="index", sync_on_compute=False
+        ).to(device)
 
     def update(self, logits: torch.Tensor, target: torch.Tensor) -> None:
         preds = (torch.sigmoid(logits) > self.threshold).long().squeeze(1)
