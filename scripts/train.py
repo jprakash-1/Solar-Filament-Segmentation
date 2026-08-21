@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=None, help="total batch size, split evenly across GPUs under torchrun")
     p.add_argument("--num-workers", type=int, default=None)
     p.add_argument("--debug-limit", type=int, default=None, help="cap train images (val capped to 1/5 of this) for a fast smoke test")
-    p.add_argument("--resume", action="store_true", help="resume from checkpoint_dir/last.pt if it exists")
+    p.add_argument("--resume", action="store_true", help="resume from checkpoint_dir/best.pt if it exists")
     return p.parse_args()
 
 
@@ -168,7 +168,7 @@ def main() -> None:
     effective_cfg = {**cfg, "model": model_cfg}
 
     if args.resume:
-        resume_path = checkpoint_dir / "last.pt"
+        resume_path = checkpoint_dir / "best.pt"
         if resume_path.exists():
             ckpt = torch.load(resume_path, map_location=device, weights_only=False)
             eval_model.load_state_dict(ckpt["model"])
