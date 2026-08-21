@@ -136,6 +136,10 @@ def main() -> None:
     model = build_model(**model_cfg).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank])
+    # Validation calls this directly instead of model(...): DDP's forward() broadcasts buffers
+    # (BatchNorm running stats) from rank 0 to all ranks as a collective on every call, but only
+    # rank 0 runs validation -- going through DDP there deadlocks waiting for the other ranks.
+    eval_model = model.module if distributed else model
 
     criterion = DiceBCELoss(**cfg["loss"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
@@ -198,13 +202,13 @@ def main() -> None:
             dist.barrier()  # other ranks wait here while rank 0 validates + checkpoints below
 
         if is_main:
-            model.eval()
+            eval_model.eval()
             val_loss_sum, iou_sum, dice_sum, n_batches = 0.0, 0.0, 0.0, 0
             epoch_dice_metric = EpochDiceScore(device, threshold=threshold)
             with torch.no_grad():
                 for images, masks, _ in tqdm(val_loader, desc=f"epoch {epoch}/{epochs} [val]"):
                     images, masks = images.to(device), masks.to(device)
-                    logits = model(images)
+                    logits = eval_model(images)
                     loss = criterion(logits, masks)
                     val_loss_sum += loss.item() * images.size(0)
                     iou, dice = compute_batch_iou_dice(logits, masks, threshold=threshold)
@@ -226,7 +230,7 @@ def main() -> None:
             writer.writerow([epoch, train_loss, val_loss, val_iou, val_dice, val_dice_tm, lr_now, elapsed])
             log_file.flush()
 
-            model_state = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
+            model_state = eval_model.state_dict()
             torch.save({"model": model_state, "config": effective_cfg, "epoch": epoch}, checkpoint_dir / "last.pt")
             if val_dice_tm > best_dice:
                 best_dice = val_dice_tm
