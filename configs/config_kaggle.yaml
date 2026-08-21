@@ -36,10 +36,10 @@ loss:
 
 train:
   epochs: 40
-  batch_size: 20 # total across GPUs (split evenly per-rank under torchrun/DistributedDataParallel,
-  # e.g. ~10/GPU on 2x T4 at image_size 768). Unlike nn.DataParallel, DDP keeps memory balanced
-  # across ranks -- no single GPU carries extra master-model/optimizer overhead. Drop to 16 then
-  # 12 if any rank OOMs.
+  batch_size: 16 # total across GPUs (split evenly per-rank under torchrun/DistributedDataParallel,
+  # e.g. ~8/GPU on 2x T4 at image_size 768); 20 OOM'd near the end of the decoder forward pass
+  # with only ~130MB free. Unlike nn.DataParallel, DDP keeps memory balanced across ranks -- no
+  # single GPU carries extra master-model/optimizer overhead. Drop to 12 if this OOMs.
   lr: 3.0e-4
   weight_decay: 1.0e-4
   scheduler: cosine
