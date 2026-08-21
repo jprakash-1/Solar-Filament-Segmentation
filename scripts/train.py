@@ -145,7 +145,13 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
 
     epochs = args.epochs or cfg["train"]["epochs"]
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    warmup_epochs = cfg["train"]["warmup_epochs"]
+    if warmup_epochs > 0:
+        warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     amp_enabled = cfg["train"]["amp"] and device.type in ("cuda", "mps")
     amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16

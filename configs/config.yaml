@@ -35,6 +35,7 @@ train:
   lr: 3.0e-4
   weight_decay: 1.0e-4
   scheduler: cosine
+  warmup_epochs: 3 # linear LR warmup (10% -> 100% of lr) before cosine decay kicks in; 0 disables warmup
   amp: true
   device: auto # auto | cuda | mps | cpu
   checkpoint_dir: outputs/checkpoints
