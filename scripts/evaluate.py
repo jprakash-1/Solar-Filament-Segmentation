@@ -30,6 +30,7 @@ from src.data.coco_utils import index_annotations_by_image, index_images_by_id, 
 from src.data.masks import rasterize_instance_masks, rasterize_semantic_mask  # noqa: E402
 from src.data.transforms import build_val_transforms  # noqa: E402
 from src.models.unet_convnext import build_model  # noqa: E402
+from src.utils.average_precision import mean_average_precision  # noqa: E402
 from src.utils.device import get_device  # noqa: E402
 from src.utils.panoptic import panoptic_quality  # noqa: E402
 from src.utils.postprocess import mask_to_instances  # noqa: E402
@@ -89,6 +90,7 @@ def main() -> None:
     iou_thresh = args.iou_thresh if args.iou_thresh is not None else cfg["evaluate"]["iou_thresh"]
 
     pq_scores, dice_scores, iou_scores = [], [], []
+    all_gt_instances, all_pred_instances, all_pred_scores = [], [], []
     for image_id in tqdm(val_ids, desc="evaluate"):
         img_meta = img_index[image_id]
         anns = ann_index[image_id]
@@ -115,10 +117,20 @@ def main() -> None:
         iou_scores.append(iou)
         pq_scores.append(pq)
 
+        pred_scores = [float(prob_map[inst].mean()) for inst in pred_instances]
+        all_gt_instances.append(gt_instances)
+        all_pred_instances.append(pred_instances)
+        all_pred_scores.append(pred_scores)
+
+    mAP, ap_per_thresh = mean_average_precision(all_gt_instances, all_pred_instances, all_pred_scores)
+
     print()
     print(f"mean Dice (semantic):  {np.mean(dice_scores):.4f}")
     print(f"mean IoU  (semantic):  {np.mean(iou_scores):.4f}")
     print(f"mean Panoptic Quality: {np.mean(pq_scores):.4f}  (IoU thresh={iou_thresh})")
+    print(f"mAP@[.5:.95]:          {mAP:.4f}")
+    print(f"  AP@0.50:             {ap_per_thresh[0.5]:.4f}")
+    print(f"  AP@0.75:             {ap_per_thresh[0.75]:.4f}")
 
 
 if __name__ == "__main__":

@@ -154,7 +154,9 @@ def main() -> None:
     checkpoint_dir = Path(cfg["train"]["checkpoint_dir"])
     log_dir = Path(cfg["train"]["log_dir"])
     threshold = cfg["train"]["val_threshold"]
+    early_stopping_patience = cfg["train"]["early_stopping_patience"]
     best_dice = -1.0
+    epochs_without_improvement = 0
     effective_cfg = {**cfg, "model": model_cfg}
 
     log_file = None
@@ -234,14 +236,29 @@ def main() -> None:
             torch.save({"model": model_state, "config": effective_cfg, "epoch": epoch}, checkpoint_dir / "last.pt")
             if val_dice_tm > best_dice:
                 best_dice = val_dice_tm
+                epochs_without_improvement = 0
                 torch.save(
                     {"model": model_state, "config": effective_cfg, "epoch": epoch, "val_dice": best_dice},
                     checkpoint_dir / "best.pt",
                 )
                 print(f"  new best (val_dice={best_dice:.4f}) -> saved {checkpoint_dir / 'best.pt'}")
+            else:
+                epochs_without_improvement += 1
+
+            should_stop = epochs_without_improvement >= early_stopping_patience
+            if should_stop:
+                print(f"  early stopping: val_dice_tm hasn't improved in {early_stopping_patience} epochs")
+        else:
+            should_stop = False
 
         if distributed:
             dist.barrier()  # hold other ranks until rank 0 finishes validation/checkpointing before next epoch
+            stop_tensor = torch.tensor([int(should_stop)], device=device)
+            dist.broadcast(stop_tensor, src=0)  # all ranks must break together, or later collectives mismatch
+            should_stop = bool(stop_tensor.item())
+
+        if should_stop:
+            break
 
     if is_main:
         log_file.close()

@@ -40,6 +40,7 @@ train:
   checkpoint_dir: outputs/checkpoints
   log_dir: outputs/logs
   val_threshold: 0.5 # probability threshold used for epoch IoU/Dice metrics
+  early_stopping_patience: 8 # stop if val_dice_tm hasn't improved in this many epochs
 
 postprocess:
   prob_threshold: 0.5
