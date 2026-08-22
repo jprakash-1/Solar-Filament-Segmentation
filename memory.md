@@ -147,3 +147,48 @@ resolution or more epochs.
 - Train_loss floor stays roughly the same at 1536px -> resolution wasn't the limiting
   factor. Move to a bigger encoder (`convnext_small`/`convnext_base`) instead, per the
   fallback plan -- don't keep pushing resolution or training duration further.
+
+---
+
+## 2026-08-22: Bigger encoder (convnext_small) at 768px, isolated from resolution
+
+**Goal**: test model capacity as the other lever besides resolution, deliberately kept
+separate from the still-running 1536px experiment above (not combined) so the two
+variables (resolution vs. capacity) can each be attributed cleanly -- the 1536px run's
+own verdict is still pending its LR fully decaying.
+
+**Changes** (`configs/config_kaggle.yaml`):
+- `model.encoder_name: tu-convnext_tiny -> tu-convnext_small` (31.9M -> 53.6M params,
+  confirmed via `build_model()` locally; `tu-convnext_small` is a valid timm model name
+  and goes through the same `smp`/timm code path as tiny, including
+  `gradient_checkpointing` -- verified locally).
+- `data.image_size: 1536 -> 768` -- reverted to isolate encoder as the only variable
+  vs. the original convnext_tiny/768px baseline.
+- `model.gradient_checkpointing`: kept `true` as a safety margin given convnext_small's
+  larger activations, even at 768px.
+- `train.batch_size: 12 -> 8` (~4/GPU) -- conservative starting point, untested on real
+  hardware. Drop to 4 if this OOMs; raise back toward 12 if it fits with headroom.
+- `postprocess.watershed_min_distance: 140` kept as a *starting point* only -- a
+  different encoder's predicted masks may shift the optimal value again, the same way it
+  needed re-tuning between 768px and 1536px on convnext_tiny. Re-sweep once trained.
+- `scripts/train.py`: `compute_run_name()` now also includes a short encoder tag (e.g.
+  `..._small_img768_bs8_gc/` vs `..._tiny_img768_bs12/`) so run folders stay
+  self-documenting now that encoder is a real experimental variable too, not just
+  resolution/batch_size/checkpointing.
+
+**Status**: not yet run on Kaggle. Needs `git pull` there, then the usual `torchrun`
+command from earlier in this file.
+
+**Results** (fill in after running):
+
+| encoder | image_size | params | batch_size | fits? | epoch | train_loss | val_dice_tm | notes |
+|---|---|---|---|---|---|---|---|---|
+| convnext_tiny | 768 | 31.9M | 12 | yes | 27 (of ~35) | ~0.329 (plateaued) | ~0.66 | baseline |
+| convnext_small | 768 | 53.6M | 8 (start) | ? | ? | ? | ? | this experiment |
+
+**Decision criteria**: if `convnext_small`'s train_loss floor drops meaningfully below
+the `convnext_tiny` baseline's ~0.30-0.32 at the *same* resolution, capacity was (at
+least part of) the ceiling -- worth trying `convnext_base` next, or combining with the
+resolution increase once both are independently confirmed to help. If it plateaus at
+roughly the same floor, capacity wasn't the limiting factor either -- worth revisiting
+the loss function itself (e.g. a boundary-aware term) rather than architecture size.

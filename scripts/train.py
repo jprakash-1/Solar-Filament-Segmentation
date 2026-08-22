@@ -60,11 +60,13 @@ def split_image_ids(ann_index: dict, val_fraction: float, seed: int) -> tuple[li
     return ids[n_val:], ids[:n_val]
 
 
-def compute_run_name(image_size: int, batch_size: int, gradient_checkpointing: bool) -> str:
-    """Auto-named per-run output folder: {timestamp}_img{size}_bs{batch}[_gc], so different
-    configs (e.g. this session's 768px vs 1536px+checkpointing experiments) don't clobber each
-    other's checkpoints/logs under the shared checkpoint_dir/log_dir roots."""
-    tag = f"img{image_size}_bs{batch_size}"
+def compute_run_name(image_size: int, batch_size: int, gradient_checkpointing: bool, encoder_name: str) -> str:
+    """Auto-named per-run output folder: {timestamp}_{encoder}_img{size}_bs{batch}[_gc], so
+    different configs (e.g. this session's convnext_tiny/768px vs convnext_small/768px vs
+    convnext_tiny/1536px+checkpointing experiments) don't clobber each other's checkpoints/logs
+    under the shared checkpoint_dir/log_dir roots."""
+    encoder_tag = encoder_name.removeprefix("tu-convnext_").removeprefix("tu-")
+    tag = f"{encoder_tag}_img{image_size}_bs{batch_size}"
     if gradient_checkpointing:
         tag += "_gc"
     return f"{datetime.now():%Y%m%d_%H%M%S}_{tag}"
@@ -198,11 +200,11 @@ def main() -> None:
     if args.resume:
         run_name = find_latest_run(checkpoint_root)
         if run_name is None:
-            run_name = compute_run_name(image_size, global_batch_size, model_cfg.get("gradient_checkpointing", False))
+            run_name = compute_run_name(image_size, global_batch_size, model_cfg.get("gradient_checkpointing", False), model_cfg["encoder_name"])
             if is_main:
                 print(f"--resume passed but no prior run found under {checkpoint_root} -- starting a new run instead")
     else:
-        run_name = compute_run_name(image_size, global_batch_size, model_cfg.get("gradient_checkpointing", False))
+        run_name = compute_run_name(image_size, global_batch_size, model_cfg.get("gradient_checkpointing", False), model_cfg["encoder_name"])
     if is_main:
         print(f"Run: {run_name}")
     checkpoint_dir = checkpoint_root / run_name
