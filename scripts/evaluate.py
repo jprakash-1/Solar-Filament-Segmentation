@@ -50,6 +50,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--debug-limit", type=int, default=None, help="cap number of val images evaluated")
     p.add_argument("--iou-thresh", type=float, default=None, help="override PQ matching IoU threshold")
+    p.add_argument("--prob-threshold", type=float, default=None, help="override postprocess.prob_threshold")
+    p.add_argument("--watershed-min-distance", type=int, default=None, help="override postprocess.watershed_min_distance")
+    p.add_argument("--min-instance-area", type=int, default=None, help="override postprocess.min_instance_area")
+    p.add_argument("--no-watershed", action="store_true", help="disable watershed, use plain connected components instead")
     return p.parse_args()
 
 
@@ -114,7 +118,17 @@ def main() -> None:
 
     images_dir = Path(cfg["data"]["train_images_dir"])
     image_size = cfg["data"]["image_size"]
-    pp = cfg["postprocess"]
+    pp = dict(cfg["postprocess"])
+    if args.prob_threshold is not None:
+        pp["prob_threshold"] = args.prob_threshold
+    if args.watershed_min_distance is not None:
+        pp["watershed_min_distance"] = args.watershed_min_distance
+    if args.min_instance_area is not None:
+        pp["min_instance_area"] = args.min_instance_area
+    if args.no_watershed:
+        pp["use_watershed"] = False
+    if is_main and (args.prob_threshold, args.watershed_min_distance, args.min_instance_area, args.no_watershed) != (None, None, None, False):
+        print(f"postprocess overrides: {pp}")
     iou_thresh = args.iou_thresh if args.iou_thresh is not None else cfg["evaluate"]["iou_thresh"]
 
     if is_main:
