@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -70,7 +71,13 @@ def main() -> None:
     set_seed(cfg["seed"])
 
     device = get_device(cfg["train"]["device"])
-    print(f"Using device: {device}")
+    print(f"Using device: {device}" + (f"  ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
+    if device.type == "cpu":
+        print(
+            f"WARNING: no GPU detected -- this will be slow. "
+            f"torch.cuda.is_available()={torch.cuda.is_available()}, "
+            f"cfg['train']['device']={cfg['train']['device']!r} (from the checkpoint's saved config)"
+        )
 
     model = build_model(**cfg["model"]).to(device)
     model.load_state_dict(ckpt["model"])
@@ -122,7 +129,16 @@ def main() -> None:
         all_pred_instances.append(pred_instances)
         all_pred_scores.append(pred_scores)
 
-    mAP, ap_per_thresh = mean_average_precision(all_gt_instances, all_pred_instances, all_pred_scores)
+    n_gt_total = sum(len(g) for g in all_gt_instances)
+    n_pred_total = sum(len(p) for p in all_pred_instances)
+    print(
+        f"Computing mAP@[.5:.95]: {n_pred_total} predicted instances vs {n_gt_total} ground-truth "
+        f"instances across {len(val_ids)} images, over 10 IoU thresholds -- this is the slow part "
+        f"(full-resolution mask matching), progress bar below."
+    )
+    t_map = time.time()
+    mAP, ap_per_thresh = mean_average_precision(all_gt_instances, all_pred_instances, all_pred_scores, show_progress=True)
+    print(f"mAP computation took {time.time() - t_map:.1f}s")
 
     print()
     print(f"mean Dice (semantic):  {np.mean(dice_scores):.4f}")
