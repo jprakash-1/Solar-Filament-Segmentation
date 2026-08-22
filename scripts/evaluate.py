@@ -10,6 +10,13 @@ script rather than part of every training epoch.
 Usage:
     python scripts/evaluate.py --checkpoint outputs/checkpoints/best.pt
     python scripts/evaluate.py --checkpoint outputs/checkpoints/last.pt --debug-limit 20
+    python scripts/evaluate.py --checkpoint outputs/checkpoints/best.pt --watershed-min-distance 45
+
+Sweep mode: predicts every image once, then tries many watershed_min_distance values
+cheaply against the cached predictions (skips redundant GPU forward passes), prints a
+PQ table, and auto-computes full mAP for the best value found:
+    python scripts/evaluate.py --checkpoint outputs/checkpoints/best.pt --sweep-watershed-min-distance
+    python scripts/evaluate.py --checkpoint outputs/checkpoints/best.pt --sweep-watershed-min-distance 10,30,50,70
 
 Multi-GPU (each rank predicts + postprocesses its own shard of the val set
 independently, then all ranks' results are gathered to rank 0 to compute mAP over the
@@ -44,6 +51,8 @@ from src.utils.panoptic import panoptic_quality  # noqa: E402
 from src.utils.postprocess import mask_to_instances  # noqa: E402
 from src.utils.seed import set_seed  # noqa: E402
 
+DEFAULT_SWEEP_GRID = "10,20,30,40,50,60,75,90,110,130"
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -54,6 +63,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--watershed-min-distance", type=int, default=None, help="override postprocess.watershed_min_distance")
     p.add_argument("--min-instance-area", type=int, default=None, help="override postprocess.min_instance_area")
     p.add_argument("--no-watershed", action="store_true", help="disable watershed, use plain connected components instead")
+    p.add_argument(
+        "--sweep-watershed-min-distance", type=str, nargs="?", const=DEFAULT_SWEEP_GRID, default=None,
+        help="sweep mode: comma-separated watershed_min_distance values to try against cached predictions "
+             "(predicts once, tries every value cheaply on CPU). Prints a PQ table, then auto-computes full "
+             "mAP for the best one. Pass with no value for a default grid.",
+    )
     return p.parse_args()
 
 
@@ -75,8 +90,21 @@ def predict_probability_map(model, image: np.ndarray, image_size: int, device: t
     return probs.squeeze().cpu().numpy()
 
 
+def compute_instances_and_scores(
+    binary_pred: np.ndarray, prob_map: np.ndarray, pp: dict
+) -> tuple[list[np.ndarray], list[float]]:
+    pred_instances = mask_to_instances(
+        binary_pred, min_area=pp["min_instance_area"], use_watershed=pp["use_watershed"],
+        watershed_min_distance=pp["watershed_min_distance"],
+    )
+    pred_scores = [float(prob_map[inst].mean()) for inst in pred_instances]
+    return pred_instances, pred_scores
+
+
 def main() -> None:
     args = parse_args()
+    sweeping = args.sweep_watershed_min_distance is not None
+    sweep_values = [int(v) for v in args.sweep_watershed_min_distance.split(",")] if sweeping else None
 
     distributed = is_distributed()
     if distributed:
@@ -129,6 +157,8 @@ def main() -> None:
         pp["use_watershed"] = False
     if is_main and (args.prob_threshold, args.watershed_min_distance, args.min_instance_area, args.no_watershed) != (None, None, None, False):
         print(f"postprocess overrides: {pp}")
+    if is_main and sweeping:
+        print(f"Sweep mode: will try watershed_min_distance in {sweep_values} against cached predictions")
     iou_thresh = args.iou_thresh if args.iou_thresh is not None else cfg["evaluate"]["iou_thresh"]
 
     if is_main:
@@ -137,8 +167,12 @@ def main() -> None:
         print(f"[rank {rank}] evaluating {len(shard_ids)} images...")
         iterator = shard_ids
 
-    pq_scores, dice_scores, iou_scores = [], [], []
-    all_gt_instances, all_pred_instances, all_pred_scores = [], [], []
+    dice_scores, iou_scores, all_gt_instances = [], [], []
+    if sweeping:
+        all_binary_preds, all_prob_maps = [], []
+    else:
+        pq_scores, all_pred_instances, all_pred_scores = [], [], []
+
     for image_id in iterator:
         img_meta = img_index[image_id]
         anns = ann_index[image_id]
@@ -150,48 +184,84 @@ def main() -> None:
 
         gt_semantic = rasterize_semantic_mask(anns, h, w).astype(bool)
         gt_instances = rasterize_instance_masks(anns, h, w)
-        pred_instances = mask_to_instances(
-            binary_pred, min_area=pp["min_instance_area"], use_watershed=pp["use_watershed"],
-            watershed_min_distance=pp["watershed_min_distance"],
-        )
 
         inter = np.logical_and(binary_pred, gt_semantic).sum()
         union = np.logical_or(binary_pred, gt_semantic).sum()
         dice = 2 * inter / (binary_pred.sum() + gt_semantic.sum()) if (binary_pred.sum() + gt_semantic.sum()) > 0 else 1.0
         iou = inter / union if union > 0 else 1.0
-        pq = panoptic_quality(gt_instances, pred_instances, iou_thresh=iou_thresh)
-
         dice_scores.append(dice)
         iou_scores.append(iou)
-        pq_scores.append(pq)
-
-        pred_scores = [float(prob_map[inst].mean()) for inst in pred_instances]
         all_gt_instances.append(gt_instances)
-        all_pred_instances.append(pred_instances)
-        all_pred_scores.append(pred_scores)
+
+        if sweeping:
+            # Deferred: pred_instances/scores depend on watershed_min_distance, which varies per
+            # sweep point below -- cache the (cheap-to-store) inputs instead of recomputing per image.
+            all_binary_preds.append(binary_pred)
+            all_prob_maps.append(prob_map)
+        else:
+            pred_instances, pred_scores = compute_instances_and_scores(binary_pred, prob_map, pp)
+            pq_scores.append(panoptic_quality(gt_instances, pred_instances, iou_thresh=iou_thresh))
+            all_pred_instances.append(pred_instances)
+            all_pred_scores.append(pred_scores)
 
     if not is_main:
         print(f"[rank {rank}] done")
 
     if distributed:
-        # mAP needs every image's predictions in one place to build a single
-        # precision-recall curve -- gather_object is the collective for arbitrary
-        # picklable Python objects (here, lists of numpy mask arrays), unlike the
-        # tensor-only collectives (all_reduce/broadcast) train.py uses. This call
-        # itself is a synchronization point, so no separate barrier is needed.
-        local_results = {
-            "dice": dice_scores, "iou": iou_scores, "pq": pq_scores,
-            "gt": all_gt_instances, "pred": all_pred_instances, "scores": all_pred_scores,
-        }
+        # mAP (and, in sweep mode, the grid search itself) needs every image's data in one place --
+        # gather_object is the collective for arbitrary picklable Python objects (here, lists of numpy
+        # mask/probability arrays), unlike the tensor-only collectives (all_reduce/broadcast) train.py
+        # uses. This call itself is a synchronization point, so no separate barrier is needed.
+        local_results = {"dice": dice_scores, "iou": iou_scores, "gt": all_gt_instances}
+        if sweeping:
+            local_results["binary_pred"] = all_binary_preds
+            local_results["prob_map"] = all_prob_maps
+        else:
+            local_results["pq"] = pq_scores
+            local_results["pred"] = all_pred_instances
+            local_results["scores"] = all_pred_scores
         gathered = [None] * world_size if is_main else None
         dist.gather_object(local_results, gathered, dst=0)
         if is_main:
             dice_scores = [x for r in gathered for x in r["dice"]]
             iou_scores = [x for r in gathered for x in r["iou"]]
-            pq_scores = [x for r in gathered for x in r["pq"]]
             all_gt_instances = [x for r in gathered for x in r["gt"]]
-            all_pred_instances = [x for r in gathered for x in r["pred"]]
-            all_pred_scores = [x for r in gathered for x in r["scores"]]
+            if sweeping:
+                all_binary_preds = [x for r in gathered for x in r["binary_pred"]]
+                all_prob_maps = [x for r in gathered for x in r["prob_map"]]
+            else:
+                pq_scores = [x for r in gathered for x in r["pq"]]
+                all_pred_instances = [x for r in gathered for x in r["pred"]]
+                all_pred_scores = [x for r in gathered for x in r["scores"]]
+
+    best_wmd = None
+    if is_main and sweeping:
+        n_gt_total = sum(len(g) for g in all_gt_instances)
+        results_table = []
+        for wmd in tqdm(sweep_values, desc="sweep"):
+            sweep_pp = {**pp, "watershed_min_distance": wmd}
+            pq_list, n_pred_total = [], 0
+            for binary_pred, prob_map, gt_instances in zip(all_binary_preds, all_prob_maps, all_gt_instances):
+                pred_instances, _ = compute_instances_and_scores(binary_pred, prob_map, sweep_pp)
+                pq_list.append(panoptic_quality(gt_instances, pred_instances, iou_thresh=iou_thresh))
+                n_pred_total += len(pred_instances)
+            results_table.append((wmd, float(np.mean(pq_list)), n_pred_total))
+
+        results_table.sort(key=lambda r: r[1], reverse=True)
+        print(f"\n{'watershed_min_distance':>24} {'mean PQ':>10} {'pred/gt instances':>20}")
+        for wmd, mean_pq, n_pred in results_table:
+            print(f"{wmd:>24} {mean_pq:>10.4f} {f'{n_pred}/{n_gt_total}':>20}")
+
+        best_wmd = results_table[0][0]
+        print(f"\nBest: watershed_min_distance={best_wmd} (mean PQ={results_table[0][1]:.4f}) -- computing full mAP for this config below.\n")
+        pp = {**pp, "watershed_min_distance": best_wmd}
+
+        pq_scores, all_pred_instances, all_pred_scores = [], [], []
+        for binary_pred, prob_map, gt_instances in zip(all_binary_preds, all_prob_maps, all_gt_instances):
+            pred_instances, pred_scores = compute_instances_and_scores(binary_pred, prob_map, pp)
+            pq_scores.append(panoptic_quality(gt_instances, pred_instances, iou_thresh=iou_thresh))
+            all_pred_instances.append(pred_instances)
+            all_pred_scores.append(pred_scores)
 
     if is_main:
         n_gt_total = sum(len(g) for g in all_gt_instances)
@@ -212,6 +282,8 @@ def main() -> None:
         print(f"mAP@[.5:.95]:          {mAP:.4f}")
         print(f"  AP@0.50:             {ap_per_thresh[0.5]:.4f}")
         print(f"  AP@0.75:             {ap_per_thresh[0.75]:.4f}")
+        if sweeping:
+            print(f"(winning watershed_min_distance={best_wmd} -- pass --watershed-min-distance {best_wmd} next time to reproduce this without re-sweeping)")
 
     if distributed:
         dist.destroy_process_group()
