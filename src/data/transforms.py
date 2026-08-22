@@ -36,3 +36,8 @@ def build_val_transforms(image_size: int) -> A.Compose:
             ToTensorV2(),
         ]
     )
+
+
+def describe_transforms(compose: A.Compose) -> str:
+    """One-line summary of a transform pipeline's steps, for startup logging."""
+    return " -> ".join(type(t).__name__ for t in compose.transforms)

@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.data.coco_utils import index_annotations_by_image, index_images_by_id, load_coco  # noqa: E402
 from src.data.dataset import FilamentSegDataset  # noqa: E402
-from src.data.transforms import build_train_transforms, build_val_transforms  # noqa: E402
+from src.data.transforms import build_train_transforms, build_val_transforms, describe_transforms  # noqa: E402
 from src.models.unet_convnext import build_model  # noqa: E402
 from src.utils.config import load_config  # noqa: E402
 from src.utils.device import get_device  # noqa: E402
@@ -117,8 +117,14 @@ def main() -> None:
     image_size = cfg["data"]["image_size"]
     images_dir = Path(cfg["data"]["train_images_dir"])
 
-    train_ds = FilamentSegDataset(train_ids, img_index, ann_index, images_dir, build_train_transforms(image_size))
-    val_ds = FilamentSegDataset(val_ids, img_index, ann_index, images_dir, build_val_transforms(image_size))
+    train_transform = build_train_transforms(image_size)
+    val_transform = build_val_transforms(image_size)
+    if is_main:
+        print(f"Train augmentations: {describe_transforms(train_transform)}")
+        print(f"Val transforms:      {describe_transforms(val_transform)}")
+
+    train_ds = FilamentSegDataset(train_ids, img_index, ann_index, images_dir, train_transform)
+    val_ds = FilamentSegDataset(val_ids, img_index, ann_index, images_dir, val_transform)
 
     global_batch_size = args.batch_size or cfg["train"]["batch_size"]
     per_device_batch_size = max(1, global_batch_size // world_size) if distributed else global_batch_size
@@ -133,6 +139,11 @@ def main() -> None:
     val_loader = DataLoader(
         val_ds, batch_size=global_batch_size, shuffle=False, num_workers=num_workers, pin_memory=(device.type == "cuda"),
     )
+    if is_main:
+        print(
+            f"Batches per epoch: {len(train_loader)} train, {len(val_loader)} val "
+            f"(batch_size={per_device_batch_size}/rank, global={global_batch_size}, num_workers={num_workers})"
+        )
 
     model = build_model(**model_cfg).to(device)
     if distributed:
@@ -141,6 +152,9 @@ def main() -> None:
     # (BatchNorm running stats) from rank 0 to all ranks as a collective on every call, but only
     # rank 0 runs validation -- going through DDP there deadlocks waiting for the other ranks.
     eval_model = model.module if distributed else model
+    if is_main:
+        n_params = sum(p.numel() for p in eval_model.parameters())
+        print(f"Model: {model_cfg['encoder_name']} encoder, decoder_use_norm={model_cfg['decoder_use_norm']}, {n_params / 1e6:.1f}M params")
 
     criterion = DiceBCELoss(**cfg["loss"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
@@ -153,10 +167,14 @@ def main() -> None:
         scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    if is_main:
+        print(f"LR schedule: warmup_epochs={warmup_epochs}, base_lr={cfg['train']['lr']}, epochs={epochs}")
 
     amp_enabled = cfg["train"]["amp"] and device.type in ("cuda", "mps")
     amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
     scaler = torch.amp.GradScaler(device="cuda", enabled=(device.type == "cuda" and amp_enabled))
+    if is_main:
+        print(f"AMP: {'enabled (' + str(amp_dtype) + ')' if amp_enabled else 'disabled'}")
 
     checkpoint_dir = Path(cfg["train"]["checkpoint_dir"])
     log_dir = Path(cfg["train"]["log_dir"])
@@ -258,21 +276,22 @@ def main() -> None:
             val_dice = dice_sum / max(1, n_batches)
             val_dice_tm = epoch_dice_metric.compute()
 
-            lr_now = optimizer.param_groups[0]["lr"]
-            elapsed = time.time() - t0
-            print(
-                f"epoch {epoch}: train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-                f"val_iou={val_iou:.4f} val_dice={val_dice:.4f} val_dice_tm={val_dice_tm:.4f} ({elapsed:.1f}s)"
-            )
-            writer.writerow([epoch, train_loss, val_loss, val_iou, val_dice, val_dice_tm, lr_now, elapsed])
-            log_file.flush()
-
             is_new_best = val_dice_tm > best_dice
             if is_new_best:
                 best_dice = val_dice_tm
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
+
+            lr_now = optimizer.param_groups[0]["lr"]
+            elapsed = time.time() - t0
+            print(
+                f"epoch {epoch}: train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+                f"val_iou={val_iou:.4f} val_dice={val_dice:.4f} val_dice_tm={val_dice_tm:.4f} "
+                f"lr={lr_now:.2e} no_improve={epochs_without_improvement}/{early_stopping_patience} ({elapsed:.1f}s)"
+            )
+            writer.writerow([epoch, train_loss, val_loss, val_iou, val_dice, val_dice_tm, lr_now, elapsed])
+            log_file.flush()
 
             checkpoint_payload = {
                 "model": eval_model.state_dict(),
@@ -284,6 +303,7 @@ def main() -> None:
                 "epochs_without_improvement": epochs_without_improvement,
             }
             torch.save(checkpoint_payload, checkpoint_dir / "last.pt")
+            print(f"  saved {checkpoint_dir / 'last.pt'}")
             if is_new_best:
                 torch.save({**checkpoint_payload, "val_dice": best_dice}, checkpoint_dir / "best.pt")
                 print(f"  new best (val_dice={best_dice:.4f}) -> saved {checkpoint_dir / 'best.pt'}")
