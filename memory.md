@@ -105,23 +105,45 @@ resolution or more epochs.
     until run on Kaggle's T4x2. Drop to 2 if this OOMs; if it fits with headroom, raise
     it back up (this is the first thing to try).
 
-**Status**: not yet run on Kaggle. Needs `git pull` there to pick this up, then:
-```
-torchrun --nproc_per_node=$(python -c "import torch; print(max(1, torch.cuda.device_count()))") \
-    scripts/train.py --config configs/config_kaggle.yaml
-```
+**Status update (2026-08-22, mid-run)**:
+- `batch_size=4` fit with huge headroom (4.3GB/15GB per GPU at 100% utilization) --
+  raised to `batch_size=12` (~6/GPU), matching the old 768px known-good value.
+- Hit a real bug on the first run: `val_loader` was sized with `global_batch_size`
+  instead of `per_device_batch_size`. Validation runs on rank 0 alone (not split across
+  ranks), so it was trying 2x the per-GPU batch that training just proved fits on a
+  single GPU -- OOM'd immediately on the first validation batch. This bug existed since
+  DDP was introduced (the two batch sizes are identical in non-distributed mode, so it
+  never showed up locally, and 768px had enough headroom to mask it there too). Fixed in
+  `scripts/train.py`.
+- Epoch-20 comparison (same epoch count both runs): `train_loss` 0.3294 (1536px) vs
+  0.3406 (768px) -- a modest ~3% improvement, but **not yet conclusive**: the 1536px
+  run is still trending down (not plateaued) and its LR is still ~56% of peak at epoch
+  20, versus the 768px comparison which required the LR fully decayed (epoch 35) to
+  confirm the plateau. Need to let this run reach a similarly LR-decayed point before
+  making the real call.
+- Postprocessing re-tuned for this resolution: `--sweep-watershed-min-distance
+  "40,60,80,100,120,140"` against an early/mid-training checkpoint (~epoch 12) found PQ
+  still climbing at the top of the range (140 best, 0.3364) -- same pattern as the 768px
+  sweep. Decided **not** to chase the exact peak further right now since this checkpoint
+  isn't converged yet (the optimum may shift once training finishes) -- locked in
+  `watershed_min_distance=140`, `min_instance_area=40` as the new config defaults
+  (`configs/config_kaggle.yaml`), matching the 768px-tuned values. Full metrics at this
+  setting on the ~epoch-12 checkpoint: Dice=0.6735, IoU=0.5223, PQ=0.3364,
+  mAP@[.5:.95]=0.1135, AP@0.50=0.3574, AP@0.75=0.0261 -- close to the 768px baseline
+  already, on a checkpoint that isn't even converged yet. Re-sweep once training
+  finishes and the final best checkpoint is available.
 
-**Results** (fill in after running):
+**Results** (fill in as the run progresses):
 
-| image_size | gradient_checkpointing | batch_size | fits? | train_loss floor | val_dice_tm | notes |
-|---|---|---|---|---|---|---|
-| 768 | no | 12 | yes | ~0.30-0.32 | ~0.65 | baseline (epoch 27 checkpoint, this file's earlier sections) |
-| 1536 | yes | 4 (start) | ? | ? | ? | this experiment |
+| image_size | gradient_checkpointing | batch_size | fits? | epoch | train_loss | val_dice_tm | notes |
+|---|---|---|---|---|---|---|---|
+| 768 | no | 12 | yes | 27 (of ~35) | ~0.329 (plateaued) | ~0.66 | baseline, LR fully decayed |
+| 1536 | yes | 12 | yes | 20 (of 40) | 0.3294 (still dropping) | 0.640 | in progress, LR still ~56% of peak |
 
-**Decision criteria**:
+**Decision criteria** (apply once the 1536px run's LR has fully decayed, not before):
 - Train_loss floor drops meaningfully below ~0.30-0.32 -> resolution was (at least part
   of) the bottleneck. Worth pushing further (try 2048 next, or more headroom at 1536 if
-  batch_size=4 leaves memory to spare).
+  there's memory to spare).
 - Train_loss floor stays roughly the same at 1536px -> resolution wasn't the limiting
   factor. Move to a bigger encoder (`convnext_small`/`convnext_base`) instead, per the
   fallback plan -- don't keep pushing resolution or training duration further.

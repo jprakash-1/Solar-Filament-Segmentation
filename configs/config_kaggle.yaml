@@ -60,9 +60,12 @@ train:
 
 postprocess:
   prob_threshold: 0.5
-  min_instance_area: 20
+  min_instance_area: 40 # raised from 20 -- see memory.md's watershed_min_distance tuning notes
   use_watershed: true
-  watershed_min_distance: 8
+  watershed_min_distance: 140 # raised from 8 -- default watershed over-segments thin/elongated/
+  # curvy filament shapes (distance-transform has multiple local peaks along one filament's
+  # length). Found via `evaluate.py --sweep-watershed-min-distance`, confirmed on both the 768px
+  # and 1536px checkpoints (PQ 0.0394 -> 0.34+ on the 768px checkpoint); see memory.md
 
 inference:
   submission_dir: outputs/submissions
