@@ -16,9 +16,13 @@ data:
   train_images_dir: /kaggle/input/competitions/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026/train/train_images
   train_annotations: /kaggle/input/competitions/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026/train/MAGFiLO_1.0_Annotations_kaggle2026_train.json
   test_images_dir: /kaggle/input/competitions/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026/test/test_images
-  image_size: 768 # downsized from native_size to fit T4 VRAM; must be divisible by 32 (5x
-  # downsampling in the ConvNeXt/U-Net encoder-decoder) -- postprocess/infer upsamples
-  # predictions back to native resolution regardless of this value
+  image_size: 1536 # train_log.csv showed train_loss/val_loss converging (no gap -> not
+  # overfitting) and plateauing even as the LR schedule fully decayed -- a capacity/detail
+  # ceiling, not a training-duration problem. Raised from 768 (where it was cut purely for
+  # T4 VRAM) now that model.gradient_checkpointing frees up encoder activation memory; see
+  # memory.md. Must be divisible by 32 (5x downsampling in the ConvNeXt/U-Net
+  # encoder-decoder) -- postprocess/infer upsamples predictions back to native resolution
+  # regardless of this value
   native_size: 2048
   val_fraction: 0.1
   num_workers: 4
@@ -29,6 +33,9 @@ model:
   in_channels: 3
   classes: 1
   decoder_use_norm: batchnorm # fine on CUDA -- the MPS batch_norm-backward bug doesn't apply here
+  gradient_checkpointing: true # recomputes encoder activations during backward instead of storing
+  # them -- trades compute time for the VRAM headroom needed to afford image_size 1536. Encoder-only
+  # (smp's U-Net decoder has no checkpointing support); see memory.md
 
 loss:
   dice_weight: 1.0
@@ -36,10 +43,11 @@ loss:
 
 train:
   epochs: 40
-  batch_size: 12 # total across GPUs (split evenly per-rank under torchrun/DistributedDataParallel,
-  # e.g. ~6/GPU on 2x T4 at image_size 768); 20 and 16 both OOM'd. Unlike nn.DataParallel, DDP
-  # keeps memory balanced across ranks -- no single GPU carries extra master-model/optimizer
-  # overhead. Drop to 8 if this OOMs.
+  batch_size: 4 # total across GPUs (~2/GPU on 2x T4). Conservative starting point for the new
+  # image_size 1536 + gradient_checkpointing combo -- untested on real hardware (see memory.md).
+  # 12 was the known-good value at the old image_size 768 (no checkpointing); at 4x the pixels
+  # per image, expect to need well below that even with checkpointing's encoder savings. Drop to
+  # 2 if this OOMs; if it fits with headroom, this is the first thing to raise back up.
   lr: 3.0e-4
   weight_decay: 1.0e-4
   scheduler: cosine
