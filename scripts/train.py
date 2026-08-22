@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import random
 import sys
 import time
@@ -35,6 +34,7 @@ from src.data.transforms import build_train_transforms, build_val_transforms, de
 from src.models.unet_convnext import build_model  # noqa: E402
 from src.utils.config import load_config  # noqa: E402
 from src.utils.device import get_device  # noqa: E402
+from src.utils.distributed import is_distributed, setup_distributed  # noqa: E402
 from src.utils.losses import DiceBCELoss  # noqa: E402
 from src.utils.metrics import EpochDiceScore, compute_batch_iou_dice  # noqa: E402
 from src.utils.seed import set_seed  # noqa: E402
@@ -57,18 +57,6 @@ def split_image_ids(ann_index: dict, val_fraction: float, seed: int) -> tuple[li
     rng.shuffle(ids)
     n_val = max(1, int(len(ids) * val_fraction))
     return ids[n_val:], ids[:n_val]
-
-
-def is_distributed() -> bool:
-    return "LOCAL_RANK" in os.environ and torch.cuda.is_available()
-
-
-def setup_distributed() -> tuple[int, int, int]:
-    """Initialize the process group (torchrun sets these env vars). Returns (local_rank, rank, world_size)."""
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
-    return local_rank, dist.get_rank(), dist.get_world_size()
 
 
 def reduce_mean(value_sum: float, count: int, device: torch.device, distributed: bool) -> float:

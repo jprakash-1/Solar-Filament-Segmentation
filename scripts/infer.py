@@ -8,6 +8,10 @@ mask size fixed at 2048x2048 per the competition's Submission File section).
 Usage:
     python scripts/infer.py --checkpoint outputs/checkpoints/best.pt
     python scripts/infer.py --checkpoint outputs/checkpoints/best.pt --limit 5 --visualize 5
+
+Multi-GPU (each rank predicts its own shard of the test set independently, then rank 0
+merges the results -- no gradient sync needed, unlike training):
+    torchrun --nproc_per_node=2 scripts/infer.py --checkpoint outputs/checkpoints/best.pt
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -37,6 +42,7 @@ from src.data.dataset import FilamentTestDataset  # noqa: E402
 from src.data.transforms import build_val_transforms  # noqa: E402
 from src.models.unet_convnext import build_model  # noqa: E402
 from src.utils.device import get_device  # noqa: E402
+from src.utils.distributed import is_distributed, setup_distributed  # noqa: E402
 from src.utils.postprocess import mask_to_instances, rle_encode  # noqa: E402
 from src.utils.seed import set_seed  # noqa: E402
 
@@ -83,12 +89,24 @@ def save_visualization(image: np.ndarray, instances: list[np.ndarray], title: st
 
 def main() -> None:
     args = parse_args()
+
+    distributed = is_distributed()
+    if distributed:
+        local_rank, rank, world_size = setup_distributed()
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank, world_size = 0, 1
+        device = None  # resolved below from the checkpoint's config
+    is_main = rank == 0
+
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
     set_seed(cfg["seed"])
 
-    device = get_device(cfg["train"]["device"])
-    print(f"Using device: {device}")
+    if device is None:
+        device = get_device(cfg["train"]["device"])
+    if is_main:
+        print(f"Using device: {device}" + (f" (multi-GPU, world_size={world_size})" if distributed else ""))
 
     model = build_model(**cfg["model"]).to(device)
     model.load_state_dict(ckpt["model"])
@@ -99,28 +117,40 @@ def main() -> None:
     dataset = FilamentTestDataset(test_images_dir, transform=build_val_transforms(image_size))
     if args.limit:
         dataset.files = dataset.files[: args.limit]
+    total_images = len(dataset.files)
+    if is_main:
+        print(f"Running inference on {total_images} test images")
+    if distributed:
+        dataset.files = dataset.files[rank::world_size]  # each rank's predictions are independent rows -- order doesn't matter
+
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=cfg["data"]["num_workers"])
-    print(f"Running inference on {len(dataset)} test images")
 
     pp = dict(cfg["postprocess"])
     if args.prob_threshold is not None:
         pp["prob_threshold"] = args.prob_threshold
 
     submission_dir = Path(cfg["inference"]["submission_dir"])
-    submission_dir.mkdir(parents=True, exist_ok=True)
+    submission_dir.mkdir(parents=True, exist_ok=True)  # every rank writes its own file here, not just rank 0
     output_path = args.output or submission_dir / f"submission_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    write_path = submission_dir / f".partial_rank{rank}.csv" if distributed else output_path
 
     viz_n = args.visualize
     viz_dir = Path("outputs/eda/predictions")
-    if viz_n > 0:
+    if is_main and viz_n > 0:
         viz_dir.mkdir(parents=True, exist_ok=True)
 
+    if is_main:
+        iterator = tqdm(loader, desc="infer")
+    else:
+        print(f"[rank {rank}] processing {len(dataset)} images...")
+        iterator = loader
+
     n_filaments = 0
-    with open(output_path, "w", newline="") as f:
+    with open(write_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["filament_id", "segmentation_rle"])
 
-        for idx, (image, stem, orig_h, orig_w) in enumerate(tqdm(loader, desc="infer")):
+        for idx, (image, stem, orig_h, orig_w) in enumerate(iterator):
             image = image.to(device)
             orig_h, orig_w = int(orig_h.item()), int(orig_w.item())
             stem = stem[0]
@@ -140,12 +170,35 @@ def main() -> None:
                 writer.writerow([f"{stem}_{k}", rle_encode(inst_mask)])
             n_filaments += len(instances)
 
-            if idx < viz_n:
+            if is_main and idx < viz_n:
                 display_image = load_image(test_images_dir, dataset.files[idx])
                 save_visualization(display_image, instances, title=f"{stem} ({len(instances)} filaments)", out_path=viz_dir / f"{stem}_pred.png")
 
-    print(f"Wrote {n_filaments} filament rows for {len(dataset)} images to {output_path}")
-    if viz_n > 0:
+    if not is_main:
+        print(f"[rank {rank}] wrote {n_filaments} rows for {len(dataset)} images")
+
+    if distributed:
+        dist.barrier()  # wait for every rank's partial file before merging
+        if is_main:
+            total_rows = 0
+            with open(output_path, "w", newline="") as out_f:
+                writer = csv.writer(out_f)
+                writer.writerow(["filament_id", "segmentation_rle"])
+                for r in range(world_size):
+                    partial_path = submission_dir / f".partial_rank{r}.csv"
+                    with open(partial_path) as in_f:
+                        reader = csv.reader(in_f)
+                        next(reader)  # that shard's own header
+                        for row in reader:
+                            writer.writerow(row)
+                            total_rows += 1
+                    partial_path.unlink()
+            print(f"Wrote {total_rows} filament rows for {total_images} images to {output_path}")
+        dist.destroy_process_group()
+    else:
+        print(f"Wrote {n_filaments} filament rows for {total_images} images to {output_path}")
+
+    if is_main and viz_n > 0:
         print(f"Saved visualizations to {viz_dir}")
 
 
