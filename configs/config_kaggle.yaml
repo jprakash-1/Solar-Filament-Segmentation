@@ -43,11 +43,10 @@ loss:
 
 train:
   epochs: 40
-  batch_size: 4 # total across GPUs (~2/GPU on 2x T4). Conservative starting point for the new
-  # image_size 1536 + gradient_checkpointing combo -- untested on real hardware (see memory.md).
-  # 12 was the known-good value at the old image_size 768 (no checkpointing); at 4x the pixels
-  # per image, expect to need well below that even with checkpointing's encoder savings. Drop to
-  # 2 if this OOMs; if it fits with headroom, this is the first thing to raise back up.
+  batch_size: 12 # total across GPUs (~6/GPU on 2x T4) at image_size 1536 + gradient_checkpointing.
+  # 4 (~2/GPU) only used 4.3GB/15GB per GPU -- lots of headroom, so raised to 12 (matches the old
+  # known-good value at image_size 768, before checkpointing/1536 existed). Drop back toward 8 then
+  # 4 if this OOMs; see memory.md.
   lr: 3.0e-4
   weight_decay: 1.0e-4
   scheduler: cosine
