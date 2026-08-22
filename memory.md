@@ -3,6 +3,13 @@
 Living record of tuning experiments for this project -- what was tried, why, and what
 happened. Append new sections as experiments run; don't delete old ones.
 
+**Note (2026-08-22)**: `scripts/train.py` now writes each run to its own auto-named
+subfolder under `checkpoint_dir`/`log_dir` (e.g.
+`outputs/checkpoints/20260822_184754_img1536_bs12_gc/`) instead of always overwriting
+the same fixed path -- this is what prevented the 1536px+checkpointing run below from
+clobbering the 768px epoch-27 baseline. `--resume` auto-detects and continues the most
+recently modified run folder rather than starting a new one.
+
 ---
 
 ## 2026-08-22: Postprocessing tuning fixed instance metrics (no retraining needed)

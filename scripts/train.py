@@ -17,6 +17,7 @@ import csv
 import random
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -57,6 +58,31 @@ def split_image_ids(ann_index: dict, val_fraction: float, seed: int) -> tuple[li
     rng.shuffle(ids)
     n_val = max(1, int(len(ids) * val_fraction))
     return ids[n_val:], ids[:n_val]
+
+
+def compute_run_name(image_size: int, batch_size: int, gradient_checkpointing: bool) -> str:
+    """Auto-named per-run output folder: {timestamp}_img{size}_bs{batch}[_gc], so different
+    configs (e.g. this session's 768px vs 1536px+checkpointing experiments) don't clobber each
+    other's checkpoints/logs under the shared checkpoint_dir/log_dir roots."""
+    tag = f"img{image_size}_bs{batch_size}"
+    if gradient_checkpointing:
+        tag += "_gc"
+    return f"{datetime.now():%Y%m%d_%H%M%S}_{tag}"
+
+
+def find_latest_run(root: Path) -> str | None:
+    """Most recently modified subdirectory of `root` that has a best.pt, or None.
+
+    Deterministic filesystem read, not clock-based -- safe to call independently on every DDP
+    rank for --resume without needing to broadcast the result (unlike compute_run_name, which
+    uses datetime.now() and is only ever used by rank 0 for anything).
+    """
+    if not root.exists():
+        return None
+    candidates = [d for d in root.iterdir() if d.is_dir() and (d / "best.pt").exists()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda d: d.stat().st_mtime).name
 
 
 def reduce_mean(value_sum: float, count: int, device: torch.device, distributed: bool) -> float:
@@ -164,8 +190,20 @@ def main() -> None:
     if is_main:
         print(f"AMP: {'enabled (' + str(amp_dtype) + ')' if amp_enabled else 'disabled'}")
 
-    checkpoint_dir = Path(cfg["train"]["checkpoint_dir"])
-    log_dir = Path(cfg["train"]["log_dir"])
+    checkpoint_root = Path(cfg["train"]["checkpoint_dir"])
+    log_root = Path(cfg["train"]["log_dir"])
+    if args.resume:
+        run_name = find_latest_run(checkpoint_root)
+        if run_name is None:
+            run_name = compute_run_name(image_size, global_batch_size, model_cfg.get("gradient_checkpointing", False))
+            if is_main:
+                print(f"--resume passed but no prior run found under {checkpoint_root} -- starting a new run instead")
+    else:
+        run_name = compute_run_name(image_size, global_batch_size, model_cfg.get("gradient_checkpointing", False))
+    if is_main:
+        print(f"Run: {run_name}")
+    checkpoint_dir = checkpoint_root / run_name
+    log_dir = log_root / run_name
     threshold = cfg["train"]["val_threshold"]
     early_stopping_patience = cfg["train"]["early_stopping_patience"]
     best_dice = -1.0
