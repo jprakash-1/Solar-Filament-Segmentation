@@ -151,7 +151,10 @@ def main() -> None:
     )
     # Validation runs on rank 0 only (val set is small) -- avoids cross-rank metric reduction.
     val_loader = DataLoader(
-        val_ds, batch_size=global_batch_size, shuffle=False, num_workers=num_workers, pin_memory=(device.type == "cuda"),
+        # per_device_batch_size, not global_batch_size: validation runs on rank 0 alone (see the
+        # comment above), so it must fit on a single GPU -- global_batch_size is sized for the
+        # *sum* across all ranks and would OOM there once resolution leaves little headroom.
+        val_ds, batch_size=per_device_batch_size, shuffle=False, num_workers=num_workers, pin_memory=(device.type == "cuda"),
     )
     if is_main:
         print(
