@@ -150,29 +150,33 @@ resolution or more epochs.
 
 ---
 
-## 2026-08-22: Bigger encoder (convnext_small) at 768px, isolated from resolution
+## 2026-08-22: Bigger encoder (convnext_small) + resolution combined
 
-**Goal**: test model capacity as the other lever besides resolution, deliberately kept
-separate from the still-running 1536px experiment above (not combined) so the two
-variables (resolution vs. capacity) can each be attributed cleanly -- the 1536px run's
-own verdict is still pending its LR fully decaying.
+**Goal**: originally planned to isolate capacity from resolution (see revision history
+below), but before this ever ran, decided to combine both instead -- faster path to
+"does this combo help at all", at the cost of not being able to attribute an
+improvement to model size vs. resolution individually. The 1536px/convnext_tiny
+experiment above is still tracked independently and unaffected by this change.
 
 **Changes** (`configs/config_kaggle.yaml`):
 - `model.encoder_name: tu-convnext_tiny -> tu-convnext_small` (31.9M -> 53.6M params,
   confirmed via `build_model()` locally; `tu-convnext_small` is a valid timm model name
   and goes through the same `smp`/timm code path as tiny, including
   `gradient_checkpointing` -- verified locally).
-- `data.image_size: 1536 -> 768` -- reverted to isolate encoder as the only variable
-  vs. the original convnext_tiny/768px baseline.
-- `model.gradient_checkpointing`: kept `true` as a safety margin given convnext_small's
-  larger activations, even at 768px.
-- `train.batch_size: 12 -> 8` (~4/GPU) -- conservative starting point, untested on real
-  hardware. Drop to 4 if this OOMs; raise back toward 12 if it fits with headroom.
+- `data.image_size: 768 -> 1536` (revised: briefly reverted to 768 to isolate the
+  encoder variable, then raised back to 1536 to combine with resolution -- see above).
+- `model.gradient_checkpointing`: kept `true`.
+- `train.batch_size: 12 -> 4` (~2/GPU) -- conservative starting point (matches
+  convnext_tiny's original first-attempt value at 1536px, which had huge headroom and
+  got raised to 12), untested on real hardware for the larger convnext_small. Drop to 2
+  if this OOMs; raise toward 8-12 if it fits with headroom.
+- `train.early_stopping_patience: 8 -> 5` -- fail faster during this experimentation
+  phase.
 - `postprocess.watershed_min_distance: 140` kept as a *starting point* only -- a
   different encoder's predicted masks may shift the optimal value again, the same way it
   needed re-tuning between 768px and 1536px on convnext_tiny. Re-sweep once trained.
 - `scripts/train.py`: `compute_run_name()` now also includes a short encoder tag (e.g.
-  `..._small_img768_bs8_gc/` vs `..._tiny_img768_bs12/`) so run folders stay
+  `..._small_img1536_bs4_gc/` vs `..._tiny_img768_bs12/`) so run folders stay
   self-documenting now that encoder is a real experimental variable too, not just
   resolution/batch_size/checkpointing.
 
@@ -184,11 +188,13 @@ command from earlier in this file.
 | encoder | image_size | params | batch_size | fits? | epoch | train_loss | val_dice_tm | notes |
 |---|---|---|---|---|---|---|---|---|
 | convnext_tiny | 768 | 31.9M | 12 | yes | 27 (of ~35) | ~0.329 (plateaued) | ~0.66 | baseline |
-| convnext_small | 768 | 53.6M | 8 (start) | ? | ? | ? | ? | this experiment |
+| convnext_tiny | 1536 | 31.9M | 12 | yes | 20 (of 40) | 0.3294 (still dropping) | 0.640 | separate experiment, in progress |
+| convnext_small | 1536 | 53.6M | 4 (start) | ? | ? | ? | ? | this experiment |
 
-**Decision criteria**: if `convnext_small`'s train_loss floor drops meaningfully below
-the `convnext_tiny` baseline's ~0.30-0.32 at the *same* resolution, capacity was (at
-least part of) the ceiling -- worth trying `convnext_base` next, or combining with the
-resolution increase once both are independently confirmed to help. If it plateaus at
-roughly the same floor, capacity wasn't the limiting factor either -- worth revisiting
-the loss function itself (e.g. a boundary-aware term) rather than architecture size.
+**Decision criteria**: if `convnext_small`+1536px's train_loss floor drops meaningfully
+below the `convnext_tiny`/768px baseline's ~0.30-0.32, the combination helped -- but
+compare against the isolated 1536px/convnext_tiny result too (once that one's LR has
+decayed) to see whether capacity added anything *beyond* what resolution alone gives.
+If it plateaus at roughly the same floor as both other rows, neither resolution nor this
+amount of extra capacity is the bottleneck -- worth revisiting the loss function itself
+(e.g. a boundary-aware term) rather than continuing to scale architecture/resolution.
