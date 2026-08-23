@@ -42,6 +42,11 @@ model:
 loss:
   dice_weight: 1.0
   bce_weight: 1.0
+  lovasz_weight: 0.5 # new -- error_analysis.py found matched-instance IoU loosely distributed
+  # (mostly 0.55-0.75, almost none above 0.85) even for correctly-detected filaments. Lovasz is a
+  # convex IoU/Jaccard surrogate, pushing directly on that overlap-tightness problem rather than
+  # just region/pixel accuracy. Conservative starting weight relative to dice/bce's 1.0 each --
+  # untested, watch train_loss magnitude/behavior on the first run and adjust; see memory.md
 
 train:
   epochs: 40

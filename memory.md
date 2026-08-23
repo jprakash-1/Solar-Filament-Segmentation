@@ -198,3 +198,53 @@ decayed) to see whether capacity added anything *beyond* what resolution alone g
 If it plateaus at roughly the same floor as both other rows, neither resolution nor this
 amount of extra capacity is the bottleneck -- worth revisiting the loss function itself
 (e.g. a boundary-aware term) rather than continuing to scale architecture/resolution.
+
+---
+
+## 2026-08-23: Error analysis -- where predictions actually go wrong
+
+Ran `scripts/error_analysis.py` (new this session) against `outputs/checkpoints/best.pt`
+(the convnext_tiny/768px epoch-27-ish checkpoint -- the fixed `best.pt` path predates
+the per-run-subfolder change above, so this reflects that older run, not the
+resolution/capacity experiments still in progress) over the full 1039-image training
+set. Three findings, each pointing at a different fix:
+
+1. **Recall > precision** (0.755 vs 0.667, gap -0.088, consistent across all 1039
+   images): the model **over-predicts** -- calls more pixels "filament" than it should,
+   more than it misses.
+2. **Matched-instance IoU is loose across the board** (n=3950 real TP matches): the
+   distribution peaks at 0.60-0.68 and almost nothing clears 0.85. Even when the model
+   *correctly* detects a filament, its predicted boundary doesn't tightly trace the true
+   shape. This directly explains the `AP@0.75` number staying low (0.026-0.035) through
+   every fix tried so far (postprocessing tuning, resolution, capacity) -- none of those
+   touch boundary tightness, only detection count/location.
+3. **FN and FP instances look almost identical to each other** (n=3351 missed, n=2767
+   spurious): same area distribution (~10^3 px, log-normal), both heavily elongated
+   (eccentricity -> 1.0, not blob-like). False positives aren't noise a postprocessing
+   filter could clean up (already extracted that gain via `watershed_min_distance`
+   tuning) -- they're genuinely filament-shaped streaks the model mistakes for real
+   ones. This may partly reflect genuine ambiguity in which faint streaks the MAGFiLO
+   annotators considered "significant" filaments, not something purely architectural.
+
+**Conclusion**: the model has learned the general visual signature of "dark elongated
+streak" reasonably well (finding 3), but lacks precision on *where* the boundary is
+(finding 2) and *which* streaks are the annotated ones (finding 3, harder to fix via
+loss alone). Finding 2 has the clearest, most directly actionable signal.
+
+**Fix**: added an optional Lovasz loss term (`smp.losses.LovaszLoss` -- a convex
+IoU/Jaccard surrogate, tighter than plain soft-IoU, already available in the same
+library used for Dice/BCE) to `src/utils/losses.py`'s `DiceBCELoss`, gated by a new
+`lovasz_weight` param defaulting to 0.0 (existing configs/checkpoints unaffected).
+Targets finding 2 directly -- rewards tighter overlap, not just region/pixel accuracy.
+Does not directly address finding 1 (precision/recall bias) or finding 3 (FN/FP
+similarity, possibly partly a labeling-ambiguity ceiling) -- worth another
+`error_analysis.py` run after this trains to see if those move too, or need a different
+fix (e.g. pos_weight tuning in the BCE term for finding 1).
+
+`configs/config_kaggle.yaml`: `loss.lovasz_weight: 0.5` -- conservative starting weight
+relative to `dice_weight`/`bce_weight`'s 1.0 each, untested at scale (verified locally
+only that it trains stably and produces finite gradients on a smoke-test run).
+
+**Results** (fill in after running): re-run `error_analysis.py` on the resulting
+checkpoint and compare the matched-instance IoU histogram and `AP@0.75` against this
+baseline (histogram peak 0.60-0.68, `AP@0.75`=0.026-0.035).
