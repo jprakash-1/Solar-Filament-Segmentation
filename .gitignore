@@ -23,7 +23,13 @@ outputs/logs/*
 outputs/submissions/*
 outputs/eda/*
 outputs/train_samples_predictions/*
+outputs/train_analysis/*
 outputs/kaggle_notebook_download/
+
+# Downloaded prediction artifacts that occasionally land at the repo root
+# instead of under outputs/ (e.g. from kaggle kernels output)
+/train_samples_predictions/
+/train_analysis/
 !outputs/checkpoints/.gitkeep
 !outputs/logs/.gitkeep
 !outputs/submissions/.gitkeep
