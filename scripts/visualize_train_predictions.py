@@ -9,6 +9,7 @@ on, as a sanity check that predictions are in the right ballpark at all.
 Usage:
     python scripts/visualize_train_predictions.py --checkpoint outputs/checkpoints/best.pt
     python scripts/visualize_train_predictions.py --checkpoint outputs/checkpoints/best.pt --n 5 --watershed-min-distance 140
+    python scripts/visualize_train_predictions.py --checkpoint outputs/checkpoints/best.pt --n -1 --watershed-min-distance 140  # all 1039 training images -- slow, one GPU forward pass + watershed per image
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
+from tqdm import tqdm  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -46,7 +48,7 @@ INSTANCE_COLORS = [
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", type=Path, required=True)
-    p.add_argument("--n", type=int, default=6, help="number of training images to visualize")
+    p.add_argument("--n", type=int, default=6, help="number of training images to visualize; <=0 means all of them")
     p.add_argument("--output-dir", type=Path, default=Path("outputs/train_samples_predictions"))
     p.add_argument("--prob-threshold", type=float, default=None, help="override postprocess.prob_threshold")
     p.add_argument("--watershed-min-distance", type=int, default=None, help="override postprocess.watershed_min_distance")
@@ -100,8 +102,8 @@ def main() -> None:
     img_index = index_images_by_id(coco)
     train_ids, _ = split_image_ids(ann_index, cfg["data"]["val_fraction"], cfg["seed"])
 
-    n = min(args.n, len(train_ids))
-    sample_ids = random.Random(cfg["seed"]).sample(train_ids, n)
+    n = len(train_ids) if args.n <= 0 else min(args.n, len(train_ids))
+    sample_ids = train_ids if n == len(train_ids) else random.Random(cfg["seed"]).sample(train_ids, n)
     print(f"Visualizing {n} of {len(train_ids)} training images (checkpoint epoch {ckpt.get('epoch')})")
 
     images_dir = Path(cfg["data"]["train_images_dir"])
@@ -119,7 +121,7 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    for image_id in sample_ids:
+    for image_id in tqdm(sample_ids, desc="visualize"):
         img_meta = img_index[image_id]
         anns = ann_index[image_id]
         image = load_image(images_dir, img_meta["file_name"])
@@ -152,7 +154,6 @@ def main() -> None:
         out_path = args.output_dir / f"{image_id}_train_compare.png"
         fig.savefig(out_path, dpi=120)
         plt.close(fig)
-        print(f"  saved {out_path}")
 
     print(f"Done. Saved {n} comparison plots to {args.output_dir}")
 
