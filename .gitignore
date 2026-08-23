@@ -22,6 +22,8 @@ outputs/checkpoints/*
 outputs/logs/*
 outputs/submissions/*
 outputs/eda/*
+outputs/train_samples_predictions/*
+outputs/kaggle_notebook_download/
 !outputs/checkpoints/.gitkeep
 !outputs/logs/.gitkeep
 !outputs/submissions/.gitkeep
