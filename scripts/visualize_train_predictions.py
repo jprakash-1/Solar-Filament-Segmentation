@@ -10,6 +10,11 @@ Usage:
     python scripts/visualize_train_predictions.py --checkpoint outputs/checkpoints/best.pt
     python scripts/visualize_train_predictions.py --checkpoint outputs/checkpoints/best.pt --n 5 --watershed-min-distance 140
     python scripts/visualize_train_predictions.py --checkpoint outputs/checkpoints/best.pt --n -1 --watershed-min-distance 140  # all 1039 training images -- slow, one GPU forward pass + watershed per image
+
+Multi-GPU (each rank predicts + plots its own shard independently -- no merge step
+needed, unlike infer.py's CSV output, since each image's PNG filename is already
+unique):
+    torchrun --nproc_per_node=2 scripts/visualize_train_predictions.py --checkpoint outputs/checkpoints/best.pt --n -1 --watershed-min-distance 140
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from pathlib import Path
 
 import cv2
 import matplotlib
+import torch.distributed as dist
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -36,6 +42,7 @@ from src.data.masks import rasterize_instance_masks  # noqa: E402
 from src.data.transforms import build_val_transforms  # noqa: E402
 from src.models.unet_convnext import build_model  # noqa: E402
 from src.utils.device import get_device  # noqa: E402
+from src.utils.distributed import is_distributed, setup_distributed  # noqa: E402
 from src.utils.postprocess import mask_to_instances  # noqa: E402
 from src.utils.seed import set_seed  # noqa: E402
 
@@ -86,12 +93,30 @@ def draw_instances(image: np.ndarray, instances: list[np.ndarray]) -> np.ndarray
 
 def main() -> None:
     args = parse_args()
+
+    distributed = is_distributed()
+    if distributed:
+        local_rank, rank, world_size = setup_distributed()
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank, world_size = 0, 1
+        device = None  # resolved below from the checkpoint's config
+    is_main = rank == 0
+
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
     set_seed(cfg["seed"])
 
-    device = get_device(cfg["train"]["device"])
-    print(f"Using device: {device}")
+    if device is None:
+        device = get_device(cfg["train"]["device"])
+    if is_main:
+        print(f"Using device: {device}" + (f"  ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else "") + (f" (multi-GPU, world_size={world_size})" if distributed else ""))
+        if device.type == "cpu":
+            print(
+                f"WARNING: no GPU detected -- this will be slow. "
+                f"torch.cuda.is_available()={torch.cuda.is_available()}, "
+                f"cfg['train']['device']={cfg['train']['device']!r} (from the checkpoint's saved config)"
+            )
 
     model = build_model(**cfg["model"]).to(device)
     model.load_state_dict(ckpt["model"])
@@ -104,7 +129,9 @@ def main() -> None:
 
     n = len(train_ids) if args.n <= 0 else min(args.n, len(train_ids))
     sample_ids = train_ids if n == len(train_ids) else random.Random(cfg["seed"]).sample(train_ids, n)
-    print(f"Visualizing {n} of {len(train_ids)} training images (checkpoint epoch {ckpt.get('epoch')})")
+    if is_main:
+        print(f"Visualizing {n} of {len(train_ids)} training images (checkpoint epoch {ckpt.get('epoch')})")
+    shard_ids = sample_ids[rank::world_size] if distributed else sample_ids
 
     images_dir = Path(cfg["data"]["train_images_dir"])
     image_size = cfg["data"]["image_size"]
@@ -117,11 +144,18 @@ def main() -> None:
         pp["min_instance_area"] = args.min_instance_area
     if args.no_watershed:
         pp["use_watershed"] = False
-    print(f"postprocess: {pp}")
+    if is_main:
+        print(f"postprocess: {pp}")
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)  # every rank writes its own files here, not just rank 0
 
-    for image_id in tqdm(sample_ids, desc="visualize"):
+    if is_main:
+        iterator = tqdm(shard_ids, desc="visualize")
+    else:
+        print(f"[rank {rank}] visualizing {len(shard_ids)} images...")
+        iterator = shard_ids
+
+    for image_id in iterator:
         img_meta = img_index[image_id]
         anns = ann_index[image_id]
         image = load_image(images_dir, img_meta["file_name"])
@@ -155,7 +189,15 @@ def main() -> None:
         fig.savefig(out_path, dpi=120)
         plt.close(fig)
 
-    print(f"Done. Saved {n} comparison plots to {args.output_dir}")
+    if not is_main:
+        print(f"[rank {rank}] done")
+
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
+
+    if is_main:
+        print(f"Done. Saved {n} comparison plots to {args.output_dir}")
 
 
 if __name__ == "__main__":
