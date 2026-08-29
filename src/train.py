@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--img-size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--num-workers", type=int, default=0, help="DataLoader worker processes; keep 0 for local CPU/MPS debugging, raise (e.g. 4) on GPU to stop data loading from bottlenecking GPU utilization")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--val-fraction", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=0)
@@ -151,13 +152,18 @@ def main() -> None:
     train_ds = FilamentDataset(args.data_json, args.images_dir, train_ids, img_size=args.img_size)
     val_ds = FilamentDataset(args.data_json, args.images_dir, val_ids, img_size=args.img_size)
 
+    pin_memory = device.type == "cuda"
+    loader_kwargs = {"num_workers": args.num_workers, "pin_memory": pin_memory}
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True  # avoid respawning worker processes every epoch
+
     if distributed:
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, num_workers=0)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, **loader_kwargs)
     else:
         train_sampler = None
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)  # rank 0 only, full val set
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **loader_kwargs)  # rank 0 only, full val set
 
     if distributed and not is_main:
         dist.barrier()  # let rank 0 download+cache the pretrained encoder weights first, avoiding a concurrent-download race

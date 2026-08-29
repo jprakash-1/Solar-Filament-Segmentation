@@ -39,9 +39,22 @@ train:
   optimizer: adam
   lr: 1.0e-3
   epochs: 30 # local default is 10 -- more epochs fit in the same wall-clock budget on a real GPU
-  batch_size: 32 # PER GPU under DDP (local default is 8, single-process) -- raise/lower depending on the attached GPU's VRAM
+  batch_size: 64 # PER GPU under DDP (local default is 8, single-process). Raised from 32 -- a first
+                 # run showed only 4.4/15 GiB GPU memory used at batch 32, plenty of headroom.
+  num_workers: 4 # local default is 0. A first run also showed 0%/100% GPU utilization split (see
+                 # env.nccl_device_id_fix below) partly worsened by serial (num_workers=0) data
+                 # loading stalling the GPU between batches.
   checkpoint_out: outputs/checkpoints/mvp1_unet_kaggle.pt
   log_csv: outputs/logs/train_log_kaggle.csv
+
+env:
+  NCCL_P2P_DISABLE: 1 # defensive -- Kaggle's virtualized dual-GPU instances are widely reported to
+                       # hang on NCCL's default peer-to-peer GPU transport
+  nccl_device_id_fix: >-
+    src/distributed.py now passes device_id explicitly to init_process_group(). Without it, NCCL
+    logged "Guessing device ID... can cause a hang if rank to GPU mapping is heterogeneous" and a
+    first run showed GPU 0 idling at 0% while GPU 1 sat at 100% -- not actually splitting compute
+    across both GPUs despite DDP being active.
 
 postprocess:
   prob_thresh: 0.5

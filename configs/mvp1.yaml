@@ -26,6 +26,7 @@ train:
   lr: 1.0e-3
   epochs: 10
   batch_size: 8
+  num_workers: 0  # keep 0 for local CPU/MPS debugging; raise (e.g. 4) on GPU -- see configs/mvp1_kaggle.yaml
 
 postprocess:
   prob_thresh: 0.5

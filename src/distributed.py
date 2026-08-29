@@ -25,7 +25,12 @@ def setup_distributed() -> tuple[int, int, int]:
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    # Pass device_id explicitly -- without it, NCCL logs "Guessing device ID... This
+    # can cause a hang if rank to GPU mapping is heterogeneous" and (observed on
+    # Kaggle T4 x2) can leave one GPU idle at 0% while the other does all the work,
+    # instead of splitting compute across both. torch.cuda.set_device() alone isn't
+    # enough for newer NCCL to pick this up eagerly.
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=torch.device(f"cuda:{local_rank}"))
     return local_rank, rank, world_size
 
 

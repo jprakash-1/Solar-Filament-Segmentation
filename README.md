@@ -156,3 +156,19 @@ explicitly post-MVP1 iteration -- see `MVP1_PLAN.md` section 6.
   run a quick `--epochs 2` smoke test on Kaggle first (2, not 1, since the
   original hang only manifested at the epoch 1 -> epoch 2 boundary) before
   committing real GPU-hours to a full run.
+- **Multi-GPU (DDP): one GPU idling at 0% while the other did 100% of the work**,
+  observed once the watchdog-timeout fix above got training running on Kaggle T4
+  x2. Two contributing causes, both fixed:
+  1. NCCL logged `Guessing device ID... This can cause a hang if rank to GPU
+     mapping is heterogeneous` -- `torch.cuda.set_device(local_rank)` alone
+     wasn't enough for NCCL to eagerly pick up the rank<->GPU mapping.
+     `src/distributed.py` now passes `device_id=torch.device(f"cuda:{local_rank}")`
+     explicitly to `init_process_group()`.
+  2. `num_workers=0` (serial data loading on the main process) can stall the GPU
+     between batches waiting on the next one, which shows up as a GPU sitting
+     idle rather than at expected utilization. Added `--num-workers` to
+     `src/train.py` (Kaggle notebook now passes `--num-workers 4`,
+     `pin_memory=True` when on CUDA).
+  Also raised `--batch-size` 32 -> 64 (per GPU) since the same run showed only
+  4.4/15 GiB GPU memory used -- plenty of headroom. **Not re-verified against
+  real hardware** (no GPU here) -- same smoke-test advice as above applies.
