@@ -123,3 +123,11 @@ explicitly post-MVP1 iteration -- see `MVP1_PLAN.md` section 6.
   known ~0.4-0.5% foreground fraction from prior EDA) instead of Otsu, and (b)
   making `src/metrics.py`'s IoU matrix bounding-box-restricted so it stays fast
   regardless of how noisy a model's predictions are.
+- **Never `pip install torch`/`torchvision` on Kaggle**: Kaggle's base image ships a
+  PyTorch build already matched to whatever GPU the kernel was assigned. Blindly
+  `pip install -r requirements.txt` reinstalls the newest PyPI wheel instead, which
+  has dropped kernel support for older cards -- hit `CUDA error: no kernel image is
+  available for execution on the device` on a P100 (sm_60; current PyPI PyTorch only
+  ships sm_70+). `train_mvp1_kaggle.ipynb` now filters `torch`/`torchvision` out of
+  the install list on Kaggle; if this still shows up, change the notebook's GPU
+  accelerator (Settings -> Accelerator -> T4 x2) rather than reinstalling torch.
