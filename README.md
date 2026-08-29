@@ -24,7 +24,8 @@ configs/
 src/
   dataset.py             # COCO parsing, group-aware split, FilamentDataset
   model.py                # tiny U-Net (segmentation_models_pytorch)
-  train.py                 # training loop (python -m src.train)
+  train.py                 # training loop (python -m src.train, or torchrun for multi-GPU)
+  distributed.py            # minimal DDP helpers (is_distributed/setup/cleanup), unused unless launched via torchrun
   infer.py                  # U-Net inference -> instances -> submission (python -m src.infer)
   postprocess.py             # prob map -> per-instance masks (upsample-then-threshold-then-CC)
   rle_utils.py                # mask <-> RLE (counts-only) helpers
@@ -54,6 +55,8 @@ python scripts/baseline_classical.py --split test   # writes outputs/submissions
 
 # Option B: tiny U-Net
 python -m src.train --epochs 10
+# or, for multi-GPU (DistributedDataParallel across every visible GPU):
+#   torchrun --nproc_per_node=2 -m src.train --epochs 30 --batch-size 32
 python -m src.infer --checkpoint outputs/checkpoints/mvp1_unet.pt --split val   # local PQ check
 python -m src.infer --checkpoint outputs/checkpoints/mvp1_unet.pt --split test  # writes outputs/submissions/mvp1_unet.csv
 
@@ -123,11 +126,25 @@ explicitly post-MVP1 iteration -- see `MVP1_PLAN.md` section 6.
   known ~0.4-0.5% foreground fraction from prior EDA) instead of Otsu, and (b)
   making `src/metrics.py`'s IoU matrix bounding-box-restricted so it stays fast
   regardless of how noisy a model's predictions are.
-- **Never `pip install torch`/`torchvision` on Kaggle**: Kaggle's base image ships a
-  PyTorch build already matched to whatever GPU the kernel was assigned. Blindly
-  `pip install -r requirements.txt` reinstalls the newest PyPI wheel instead, which
-  has dropped kernel support for older cards -- hit `CUDA error: no kernel image is
-  available for execution on the device` on a P100 (sm_60; current PyPI PyTorch only
-  ships sm_70+). `train_mvp1_kaggle.ipynb` now filters `torch`/`torchvision` out of
-  the install list on Kaggle; if this still shows up, change the notebook's GPU
-  accelerator (Settings -> Accelerator -> T4 x2) rather than reinstalling torch.
+- **Never `pip install torch`/`torchvision` on Kaggle**: blindly
+  `pip install -r requirements.txt` reinstalls the newest PyPI wheel, which has
+  dropped kernel support for older cards -- `train_mvp1_kaggle.ipynb` now filters
+  `torch`/`torchvision` out of the install list on Kaggle to avoid that. But hit
+  `CUDA error: no kernel image is available for execution on the device` on a P100
+  (sm_60) even with that fix, because **Kaggle's own preinstalled PyTorch has
+  already dropped sm_60 support** (current builds ship sm_70+ only) -- the P100 is
+  now too old for Kaggle's default image regardless of what we pip install. The
+  actual fix is changing the notebook's GPU accelerator (Settings -> Accelerator ->
+  T4 x2); there's no code-side fix for a genuinely unsupported GPU architecture.
+- **Multi-GPU (DDP) has not been run successfully anywhere yet**: `src/train.py` +
+  `src/distributed.py` add DistributedDataParallel support (`torchrun
+  --nproc_per_node=N -m src.train`), used by `train_mvp1_kaggle.ipynb` for Kaggle's
+  T4 x2. The single-process path was regression-tested locally after every change
+  and is unaffected. A local 2-process CPU/`gloo` dry-run was *attempted* to
+  exercise the DDP control flow (sampler.set_epoch, rank-0-only
+  validation/checkpointing between barriers, unwrapping `model.module.state_dict()`)
+  before trusting it on Kaggle GPU-hours, but `torchrun` hung indefinitely in this
+  sandboxed environment (no worker processes ever spawned) and was killed --
+  inconclusive, not a pass. The DDP code is logic-reviewed and syntax/import-checked
+  only. **Run a quick `--epochs 1` smoke test on Kaggle first** and watch for a
+  hang/deadlock before committing real GPU-hours to a full run.

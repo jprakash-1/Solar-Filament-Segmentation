@@ -1,4 +1,4 @@
-# MVP1 settings record for the Kaggle GPU environment (notebooks/01_train_kaggle.ipynb).
+# MVP1 settings record for the Kaggle GPU environment (train_mvp1_kaggle.ipynb).
 # Same caveat as configs/mvp1.yaml: documentation of the CLI flags the notebook
 # passes to src/train.py / src/infer.py, not live-loaded by any script.
 #
@@ -12,7 +12,7 @@
 data:
   # Auto-detected at runtime in the notebook by globbing /kaggle/input for the
   # annotation json (the exact mount folder name depends on how the dataset was
-  # attached to the kernel) -- see notebooks/01_train_kaggle.ipynb section 2.
+  # attached to the kernel) -- see train_mvp1_kaggle.ipynb section 2.
   data_json: <auto-detected under /kaggle/input, see notebook>
   train_images_dir: <auto-detected>
   test_images_dir: <auto-detected>
@@ -29,12 +29,17 @@ model:
   img_size: 256 # unchanged from local -- raising this is a post-MVP1 iteration, not a Kaggle-vs-local difference
 
 train:
-  device: cuda
+  launch: torchrun --nproc_per_node=<gpu count, auto-detected in the notebook> -m src.train
+  # DDP across every visible GPU (e.g. Kaggle's T4 x2), not just the first one.
+  # A plain `python -m src.train` still runs single-process/single-GPU, unchanged --
+  # distributed mode only activates under torchrun (src/distributed.is_distributed()).
+  # See src/train.py's module docstring for what's simplified in the DDP path
+  # (rank-0-only validation/checkpointing, non-all-reduced per-epoch train metrics).
   loss: bce_with_logits + dice_loss
   optimizer: adam
   lr: 1.0e-3
   epochs: 30 # local default is 10 -- more epochs fit in the same wall-clock budget on a real GPU
-  batch_size: 32 # local default is 8 -- raise/lower depending on the attached GPU's VRAM
+  batch_size: 32 # PER GPU under DDP (local default is 8, single-process) -- raise/lower depending on the attached GPU's VRAM
   checkpoint_out: outputs/checkpoints/mvp1_unet_kaggle.pt
   log_csv: outputs/logs/train_log_kaggle.csv
 
