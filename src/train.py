@@ -20,9 +20,16 @@ a deliberate simplification for MVP1; directionally informative, not exact.
 Validation runs on rank 0 only, against the full val set, so val_dice/checkpoint
 selection stays exact regardless of world size.
 
-Caveat: this DDP path has not been run against real multi-GPU hardware (only
-logic-reviewed + a local CPU/gloo dry-run, which hung inconclusively in a sandboxed
-environment -- see README.md's "Known gotchas"). Smoke-test with --epochs 1 first.
+Caveat: hit a real NCCL watchdog timeout on Kaggle T4 x2 -- epoch 1 completed and
+checkpointed fine on both ranks, then hung at the epoch 2 boundary. Root cause: DDP
+broadcasts buffers (BatchNorm running stats etc.) on every forward() call by
+default, but validation only called forward() on rank 0, so rank 0 issued broadcast
+collectives rank 1 never joined. Fixed by validating through model.module (the
+unwrapped model, zero collective communication) instead of the DDP-wrapped model --
+see the eval_model line below. Not yet re-verified against real hardware (no GPU
+available in this environment); smoke-test with --epochs 2 on Kaggle first (the
+hang only manifested at the epoch 1->2 boundary, so 1 epoch alone won't catch a
+regression). See README.md's "Known gotchas" for the full writeup.
 
 Usage:
     python -m src.train
@@ -178,7 +185,16 @@ def main() -> None:
             dist.barrier()  # keep other ranks from racing ahead into next epoch while rank 0 validates/checkpoints
 
         if is_main:
-            val_loss, val_dice = run_epoch(model, val_loader, device, optimizer=None)
+            # Use the unwrapped module for validation, not the DDP-wrapped `model` --
+            # DDP broadcasts buffers (BatchNorm running stats, etc.) at the start of
+            # EVERY forward() call by default (broadcast_buffers=True), on every rank.
+            # Since only rank 0 runs this validation loop, calling the DDP wrapper
+            # here would issue broadcast collectives rank 1 never joins -> NCCL
+            # watchdog timeout (hit exactly this: a clean epoch 1, then a hang at the
+            # epoch 2 boundary). model.module is a plain nn.Module with zero collective
+            # communication, which is what we want for a rank-0-only eval pass.
+            eval_model = model.module if distributed else model
+            val_loss, val_dice = run_epoch(eval_model, val_loader, device, optimizer=None)
             print(f"epoch {epoch:>2}: train_loss={train_loss:.4f} train_dice={train_dice:.4f}  val_loss={val_loss:.4f} val_dice={val_dice:.4f}")
 
             with open(args.log_csv, "a", newline="") as f:

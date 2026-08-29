@@ -136,15 +136,23 @@ explicitly post-MVP1 iteration -- see `MVP1_PLAN.md` section 6.
   now too old for Kaggle's default image regardless of what we pip install. The
   actual fix is changing the notebook's GPU accelerator (Settings -> Accelerator ->
   T4 x2); there's no code-side fix for a genuinely unsupported GPU architecture.
-- **Multi-GPU (DDP) has not been run successfully anywhere yet**: `src/train.py` +
-  `src/distributed.py` add DistributedDataParallel support (`torchrun
-  --nproc_per_node=N -m src.train`), used by `train_mvp1_kaggle.ipynb` for Kaggle's
-  T4 x2. The single-process path was regression-tested locally after every change
-  and is unaffected. A local 2-process CPU/`gloo` dry-run was *attempted* to
-  exercise the DDP control flow (sampler.set_epoch, rank-0-only
-  validation/checkpointing between barriers, unwrapping `model.module.state_dict()`)
-  before trusting it on Kaggle GPU-hours, but `torchrun` hung indefinitely in this
-  sandboxed environment (no worker processes ever spawned) and was killed --
-  inconclusive, not a pass. The DDP code is logic-reviewed and syntax/import-checked
-  only. **Run a quick `--epochs 1` smoke test on Kaggle first** and watch for a
-  hang/deadlock before committing real GPU-hours to a full run.
+- **Multi-GPU (DDP): NCCL watchdog timeout after a clean epoch 1, hit on real
+  Kaggle T4 x2 hardware**. `src/train.py` + `src/distributed.py` add
+  DistributedDataParallel support (`torchrun --nproc_per_node=N -m src.train`),
+  used by `train_mvp1_kaggle.ipynb`. Epoch 1 completed and checkpointed
+  successfully on both ranks, then the collective op count between ranks
+  diverged and both hung until NCCL's 10-minute watchdog killed the job.
+  **Root cause**: DDP broadcasts buffers (BatchNorm running stats, etc.) at the
+  start of *every* `forward()` call by default (`broadcast_buffers=True`), on
+  every rank -- but validation only ran `model(img)` on rank 0 (the
+  `if is_main:` block), so rank 0 issued a batch of broadcast collectives every
+  epoch that rank 1 never joined. **Fix**: validation now forwards through
+  `model.module` (the plain, unwrapped `nn.Module`), which does zero collective
+  communication, instead of the DDP-wrapped `model`. Also added
+  `NCCL_P2P_DISABLE=1` to the notebook's launch command defensively, since
+  Kaggle's virtualized dual-GPU instances are separately, widely reported to
+  have flaky NCCL peer-to-peer transport. **Neither fix has been re-verified
+  against real multi-GPU hardware yet** (no GPU available in this environment) --
+  run a quick `--epochs 2` smoke test on Kaggle first (2, not 1, since the
+  original hang only manifested at the epoch 1 -> epoch 2 boundary) before
+  committing real GPU-hours to a full run.
