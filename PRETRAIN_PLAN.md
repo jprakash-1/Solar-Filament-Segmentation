@@ -116,6 +116,22 @@ access — every later stage mounts a Kaggle Dataset instead.
   intensity per radial bin, computed once from a sample of raw frames — which
   measurably flattens a real held-out frame's profile (checked: pre-correction
   ~3206→2457 center-to-limb, post-correction flat at ~3200 throughout).
+- **Output resolution: full native `2048×2048`, 1-channel — no crop or resize
+  down to a smaller pretraining resolution.** Verified this matches MAGFiLO's
+  own input convention exactly, not just approximately: a real MAGFiLO
+  training image is itself `2048×2048`, single-channel (`L` mode), with the
+  same GONG-style filename and the *same* disk framing — its off-disk corners
+  read exactly `0`, and its limb sits right at radius ~900 around `(1024,
+  1024)`, identical to the raw "haf" product's standardized geometry above.
+  Keeping Stage 2's output at native resolution means there's no train/pretrain
+  resolution mismatch to bridge at Stage 4 fine-tuning time, and no
+  information is thrown away that a later change of ViT input size might want.
+  **Consequence for Stage 3**: a ViT can't operate on the full `2048×2048`
+  frame directly — at patch=16 that's 128×128=16,384 patches (even after MAE's
+  75% masking, ~4,096 visible tokens, ~28× the token count of a 384px/patch=16
+  setup, quadratic in attention cost). Stage 3's dataset instead samples a
+  disk-radius-bounded crop from these full-resolution frames per training
+  step — see section 4.1.
 
 Implementation: `scripts/pretrain_data/preprocess_gong.py`, run once over the
 downloaded corpus:
@@ -125,19 +141,23 @@ python scripts/pretrain_data/preprocess_gong.py \
     --raw-dir data/raw/gong_pretrain --out-dir data/processed/gong_pretrain
 ```
 
-Two passes: (1) samples `--profile-sample-size` frames (default 200) to build
-one shared empirical limb-darkening profile (`limb_profile.npy`), printing the
-pre-correction profile so a wildly non-monotonic result is visible immediately;
-(2) processes every frame — disk-crop via header geometry → limb-darkening
-correct → resize to `IMG_SIZE` (384, a multiple of ViT patch size 16) →
-per-image z-score normalize → per-site stuck-camera dedup (frame-differencing,
-threshold tuned empirically on normalized-scale data — see the script's
+Two passes: (1) samples `--profile-sample-size` frames (default 50 — kept
+small since each sampled frame is a full `2048×2048` float32 array, ~16.8MB) to
+build one shared empirical limb-darkening profile (`limb_profile.npy`),
+printing the pre-correction profile so a wildly non-monotonic result is
+visible immediately; (2) processes every frame — limb-darkening correct (at
+full native resolution, using the header's own `cx`/`cy`/`r`) → per-image
+z-score normalize → per-site stuck-camera dedup (frame-differencing, threshold
+tuned empirically on normalized-scale data — see the script's
 `DEDUP_THRESHOLD` comment) → corpus-level mean/std over the kept set
 (`dataset_stats.json`), which Stage 3's dataloader should normalize with
-instead of ImageNet stats. Output: one `.npy` per kept frame plus
-`manifest.csv` (path, site, disk center/radius, and `resized_r` — the disk
-radius rescaled into the final `IMG_SIZE` frame, which Stage 3's
-disk-radius-bounded crop augmentation needs).
+instead of ImageNet stats. Both the dedup and the corpus-stats pass are
+streaming (one frame in memory at a time, plus one running "previous frame"
+per site) rather than stacking the whole corpus into one array — at
+`2048×2048` float32, a 10K-image corpus would be ~167GB if held in memory at
+once, so this isn't optional at this resolution. Output: one `.npy` per kept
+frame (native `2048×2048`, `float32`) plus `manifest.csv` (path, site, disk
+center/radius in the frame's own native pixel coordinates).
 
 Save output as Kaggle Dataset `halpha-preprocessed` — every future pretraining
 session mounts this read-only, no re-downloading or re-processing.
@@ -148,18 +168,24 @@ session mounts this read-only, no re-downloading or re-processing.
 
 ### 4.1 Dataset / augmentation
 
+Stage 2's `.npy` files are the full native `2048×2048` frame (see section 3), so
+this dataset's job includes sampling the actual ViT-sized training crop, not
+just loading a pre-sized image:
+
 ```python
 # dataset.py
 import numpy as np, pandas as pd, torch, random
 from torch.utils.data import Dataset
 
 class HalphaMAEDataset(Dataset):
-    def __init__(self, manifest_csv, img_size=384, train=True):
+    def __init__(self, manifest_csv, crop_size=384, train=True):
         manifest = pd.read_csv(manifest_csv)
         self.paths = manifest["path"].tolist()
-        self.radii = manifest["r"].tolist()  # disk radius in the *original* frame;
-        # rescaled below since Stage 2 already resized to img_size before saving
-        self.img_size = img_size
+        self.cx = manifest["cx"].tolist()
+        self.cy = manifest["cy"].tolist()
+        self.r = manifest["r"].tolist()  # disk radius, in the *native* 2048x2048
+        # frame -- Stage 2 no longer resizes, so no rescaling needed here
+        self.crop_size = crop_size
         self.train = train
 
     def __len__(self):
@@ -167,9 +193,31 @@ class HalphaMAEDataset(Dataset):
 
     def __getitem__(self, idx):
         img = np.load(self.paths[idx]).astype(np.float32)
+        img = self._disk_bounded_crop(img, self.cx[idx], self.cy[idx], self.r[idx])
         if self.train:
             img = self._augment(img)
-        return torch.from_numpy(img).unsqueeze(0)  # [1, H, W]
+        return torch.from_numpy(img).unsqueeze(0)  # [1, crop_size, crop_size]
+
+    def _disk_bounded_crop(self, img, cx, cy, r):
+        # Sample the crop's *center* uniformly within the solar disk (not an
+        # unbounded crop over the full 2048x2048 frame) -- an unbounded crop
+        # can land mostly off-disk (pure background), which would let the MAE
+        # pretext task shortcut on "is this patch background" rather than
+        # learning filament-relevant texture. The crop can still extend past
+        # the limb near its edges (real limb-adjacent frames are valid too),
+        # just not be centered on pure background.
+        half = self.crop_size / 2
+        for _ in range(10):  # a handful of rejection-sample attempts is plenty
+            angle = random.uniform(0, 2 * np.pi)
+            radius = r * (random.random() ** 0.5)  # uniform over disk *area*, not radius
+            cx_s = cx + radius * np.cos(angle)
+            cy_s = cy + radius * np.sin(angle)
+            x0, y0 = int(cx_s - half), int(cy_s - half)
+            if 0 <= x0 and x0 + self.crop_size <= img.shape[1] and 0 <= y0 and y0 + self.crop_size <= img.shape[0]:
+                return img[y0:y0 + self.crop_size, x0:x0 + self.crop_size]
+        # fallback: disk-centered crop, always in-bounds given r=900, crop=384
+        cx_i, cy_i = int(cx), int(cy)
+        return img[cy_i - int(half):cy_i + int(half), cx_i - int(half):cx_i + int(half)]
 
     def _augment(self, img):
         # rotation is valid here -- no canonical "up" on the Sun
@@ -179,14 +227,13 @@ class HalphaMAEDataset(Dataset):
         if random.random() < 0.5:
             gamma = random.uniform(0.8, 1.2)
             img = np.sign(img) * (np.abs(img) ** gamma)
-        # deliberately no random-resized-crop here: an unbounded crop can land
-        # mostly off-disk (pure background) or straddle the limb, which would let
-        # the MAE pretext task shortcut on limb position rather than learning
-        # filament-relevant texture. A disk-radius-bounded crop needs the radius
-        # carried through Stage 2's manifest (done above) -- implement before
-        # adding cropping augmentation, don't add unbounded RandomResizedCrop.
         return img
 ```
+
+Not yet run against real data (Stage 3 isn't implemented as actual code yet,
+unlike Stages 1-2) — verify `_disk_bounded_crop` against a handful of real
+`.npy` frames once Stage 3 is built, the same way Stage 2's limb-darkening
+correction was checked here before being trusted.
 
 ### 4.2 Model (HuggingFace ViTMAE, 1-channel)
 
@@ -413,11 +460,16 @@ Launch cell:
       and Mauna Loa frames, see section 3.
 - [x] Limb-darkening correction — the parametric formula failed a real flatness
       check and was replaced with an empirical profile, see section 3.
+- [x] Output resolution/channels — kept native `2048×2048`, 1-channel,
+      verified to match MAGFiLO's own training images exactly, see section 3.
 - [ ] Decide ViT-Small vs. ViT-Base from the first session's measured
       images/sec at each scale on 2×T4, not up front.
-- [ ] Implement the disk-radius-bounded crop in Stage 3's `_augment()` — the
-      manifest already carries `resized_r` per image (Stage 2) specifically so
-      this doesn't need a second data pass later.
+- [ ] Verify `HalphaMAEDataset._disk_bounded_crop` (section 4.1) against real
+      `.npy` frames once Stage 3 is actually implemented — it's still
+      illustrative pseudocode, unlike Stages 1-2's tested scripts.
+- [ ] Pick a `crop_size` (default 384 above) against the ViT patch size chosen
+      in section 4.2 — this is now decoupled from Stage 2's output resolution,
+      so it can change without touching the preprocessed corpus.
 - [ ] Pick `SESSION_BUDGET_SECONDS` against the actual per-session cap Kaggle grants
       the account (varies by verification tier) rather than assuming 8h flat.
 - [ ] Tune `--day-stride` / `--max-images` once a real manifest is built, so the

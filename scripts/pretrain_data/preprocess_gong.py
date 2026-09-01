@@ -1,15 +1,29 @@
 #!/usr/bin/env python3
-"""Stage 2: disk-crop, limb-darkening correct, resize, dedup, and normalize
-downloaded GONG H-Alpha FITS frames.
+"""Stage 2: limb-darkening correct, dedup, and normalize downloaded GONG H-Alpha
+FITS frames, keeping the full native 2048x2048, 1-channel frame -- matching
+MAGFiLO's own input convention exactly (verified: a real MAGFiLO training image
+is itself a 2048x2048, single-channel (`L` mode) image, with the same
+GONG-style filename and the same disk center/radius framing -- off-disk corners
+read exactly 0, and the limb sits right at radius ~900 around (1024, 1024), the
+same standardized geometry as the raw "haf" product below). No resize/crop to a
+smaller pretraining resolution, so there's no train/pretrain resolution
+mismatch to bridge at Stage 4 fine-tuning time.
 
 Verified against real files (see PRETRAIN_PLAN.md section 3): GONG's own
-processing pipeline already re-registers every "haf" (reduced) frame to a
-standardized geometry -- disk center at pixel (1024, 1024), radius 900px, in
-a 2048x2048 frame (`FNDLMBXC`/`FNDLMBYC`/`FNDLMBMA`/`FNDLMBMI` header keys).
-This holds across sites (checked Big Bear and Mauna Loa samples), so disk
-detection here is a matter of *reading* that header geometry, not deriving it.
-`CRPIX1`/`CRPIX2` + a flat `RADIUS=900` are kept as a fallback only, in case a
-future frame's limb-fit keys are missing or malformed.
+processing pipeline already re-registers every "haf" (reduced) frame to that
+standardized geometry -- disk center at pixel (1024, 1024), radius 900px, in a
+2048x2048 frame (`FNDLMBXC`/`FNDLMBYC`/`FNDLMBMA`/`FNDLMBMI` header keys). This
+holds across sites (checked Big Bear and Mauna Loa samples), so disk geometry
+here is read from the header, not derived via CV. `CRPIX1`/`CRPIX2` + a flat
+`RADIUS=900` are kept as a fallback only, in case a future frame's limb-fit
+keys are missing or malformed.
+
+Note for Stage 3: a ViT operating on the full 2048x2048 frame directly is not
+feasible on 2xT4 -- at patch=16 that's 128x128=16384 patches (even after MAE's
+75% masking, ~4096 visible tokens, ~28x the token count of a 384px/patch=16
+setup). Stage 3's dataset should sample a disk-radius-bounded crop (e.g.
+384/512px) from these full-resolution frames per training step instead of
+feeding the whole frame to the encoder -- see PRETRAIN_PLAN.md section 4.
 
 Usage:
     python scripts/pretrain_data/preprocess_gong.py \
@@ -23,12 +37,9 @@ import csv
 import json
 from pathlib import Path
 
-import cv2
 import numpy as np
 from astropy.io import fits
 
-IMG_SIZE = 384  # multiple of ViT patch size 16; revisit against the eventual encoder
-CROP_MARGIN = 1.05  # small margin beyond the disk radius so limb pixels aren't clipped
 DEDUP_THRESHOLD = 0.01  # mean abs difference is measured *after* per-image
 # z-score normalization (mean 0, std 1), so this is on a normalized scale, not
 # raw pixel counts. Calibrated against two real, genuinely-different-hour Big
@@ -36,6 +47,8 @@ DEDUP_THRESHOLD = 0.01  # mean abs difference is measured *after* per-image
 # repeat (byte-identical source data) differs by ~1e-7 (floating-point noise
 # only), so 0.01 sits comfortably between the two without needing a higher
 # threshold that would risk treating legitimately different hours as dups.
+
+N_PROFILE_BINS = 32
 
 
 def read_disk_geometry(header: fits.Header) -> tuple[float, float, float]:
@@ -52,61 +65,45 @@ def read_disk_geometry(header: fits.Header) -> tuple[float, float, float]:
     return float(cx), float(cy), float(r)
 
 
-def crop_to_disk(img: np.ndarray, cx: float, cy: float, r: float, margin: float = CROP_MARGIN) -> np.ndarray:
-    half = r * margin
-    x0, x1 = int(round(cx - half)), int(round(cx + half))
-    y0, y1 = int(round(cy - half)), int(round(cy + half))
-    h, w = img.shape
-    pad_left, pad_top = max(0, -x0), max(0, -y0)
-    pad_right, pad_bottom = max(0, x1 - w), max(0, y1 - h)
-    if pad_left or pad_top or pad_right or pad_bottom:
-        img = np.pad(img, ((pad_top, pad_bottom), (pad_left, pad_right)), mode="constant")
-        x0, x1, y0, y1 = x0 + pad_left, x1 + pad_left, y0 + pad_top, y1 + pad_top
-    return img[y0:y1, x0:x1]
-
-
-N_PROFILE_BINS = 32
-
-
-def _rho_grid(shape: tuple[int, int], r: float) -> np.ndarray:
+def _rho_grid(shape: tuple[int, int], cx: float, cy: float, r: float) -> np.ndarray:
     h, w = shape
-    cy, cx = (h - 1) / 2.0, (w - 1) / 2.0  # image is already disk-centered by crop_to_disk
     yy, xx = np.mgrid[0:h, 0:w]
     return np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / r
 
 
-def compute_radial_profile(images: list[np.ndarray], r: float, n_bins: int = N_PROFILE_BINS) -> np.ndarray:
+def compute_radial_profile(images: list[np.ndarray], cx: float, cy: float, r: float,
+                            n_bins: int = N_PROFILE_BINS) -> np.ndarray:
     """Empirical mean intensity per radial bin, pooled over a sample of
-    (cropped, uncorrected) images. Used instead of a parametric limb-darkening
-    law: a first attempt with the textbook photospheric-continuum formula
-    1/(0.3 + 0.7*mu) badly *overcorrected* real GONG Halpha frames -- checked
-    with check_limb_flatness() below, the "corrected" profile sloped upward
-    toward the limb instead of flattening. Halpha center-to-limb variation is
-    much milder than continuum limb darkening (it's chromospheric emission,
-    not photospheric), so a generic continuum formula doesn't transfer; an
+    (uncorrected) full frames sharing the same standardized (cx, cy, r). Used
+    instead of a parametric limb-darkening law: a first attempt with the
+    textbook photospheric-continuum formula 1/(0.3 + 0.7*mu) badly
+    *overcorrected* real GONG Halpha frames -- checked with
+    check_limb_flatness() below, the "corrected" profile sloped upward toward
+    the limb instead of flattening. Halpha center-to-limb variation is much
+    milder than continuum limb darkening (it's chromospheric emission, not
+    photospheric), so a generic continuum formula doesn't transfer; an
     empirical profile fit to this data does, by construction."""
     if not images:
         raise ValueError("need at least one image to compute a radial profile")
-    rho = _rho_grid(images[0].shape, r)
+    rho = _rho_grid(images[0].shape, cx, cy, r)
     bins = np.linspace(0, 1, n_bins + 1)
     profile = np.empty(n_bins, dtype=np.float64)
     for i, (lo, hi) in enumerate(zip(bins[:-1], bins[1:])):
         mask = (rho >= lo) & (rho < hi)
         vals = np.concatenate([img[mask] for img in images]) if mask.any() else np.array([np.nan])
         profile[i] = vals.mean()
-    # guard against a noisy/near-empty outermost bin (few pixels right at the
-    # crop edge) producing a wild correction factor
+    # guard against a noisy/near-empty outermost bin producing a wild correction factor
     profile = np.where(np.isnan(profile), profile[~np.isnan(profile)][-1], profile)
     return profile
 
 
-def limb_darkening_correct(img: np.ndarray, r: float, profile: np.ndarray) -> np.ndarray:
+def limb_darkening_correct(img: np.ndarray, cx: float, cy: float, r: float, profile: np.ndarray) -> np.ndarray:
     """Radial intensity normalization using an empirical profile (see
     compute_radial_profile). Off-disk background (rho >= 1) is left untouched
     -- the profile is only defined inside the solar disk, and applying a
     correction off-disk would amplify background noise instead of leaving it flat."""
     n_bins = len(profile)
-    rho = _rho_grid(img.shape, r)
+    rho = _rho_grid(img.shape, cx, cy, r)
     on_disk = rho < 1.0
     bin_idx = np.clip((rho * n_bins).astype(int), 0, n_bins - 1)
     correction = profile[0] / profile[bin_idx]
@@ -115,12 +112,12 @@ def limb_darkening_correct(img: np.ndarray, r: float, profile: np.ndarray) -> np
     return out
 
 
-def check_limb_flatness(img: np.ndarray, r: float, n_bins: int = 10) -> list[float]:
+def check_limb_flatness(img: np.ndarray, cx: float, cy: float, r: float, n_bins: int = 10) -> list[float]:
     """Diagnostic: mean intensity per radial bin (0 = center, 1 = limb). A
     correctly limb-darkening-corrected image should show roughly flat values
     across bins; a rising/falling trend means the profile sample was too small
     or unrepresentative."""
-    rho = _rho_grid(img.shape, r)
+    rho = _rho_grid(img.shape, cx, cy, r)
     bins = np.linspace(0, 1, n_bins + 1)
     means = []
     for lo, hi in zip(bins[:-1], bins[1:]):
@@ -129,55 +126,77 @@ def check_limb_flatness(img: np.ndarray, r: float, n_bins: int = 10) -> list[flo
     return means
 
 
-def load_and_crop(fits_path: Path) -> tuple[np.ndarray, float, dict]:
+def load_frame(fits_path: Path) -> tuple[np.ndarray, dict]:
+    """Full native 2048x2048, 1-channel frame (uncorrected) plus its disk geometry."""
     with fits.open(fits_path) as hdul:
         data_hdu = hdul[1] if len(hdul) > 1 else hdul[0]
         data = data_hdu.data.astype(np.float32)
         header = data_hdu.header
         cx, cy, r = read_disk_geometry(header)
-    cropped = crop_to_disk(data, cx, cy, r)
-    return cropped, r, {"cx": cx, "cy": cy, "r": r}
+    return data, {"cx": cx, "cy": cy, "r": r}
 
 
 def process_one(fits_path: Path, profile: np.ndarray) -> tuple[np.ndarray, dict]:
-    cropped, crop_r, meta = load_and_crop(fits_path)
-    corrected = limb_darkening_correct(cropped, crop_r, profile)
-    resized = cv2.resize(corrected, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
-    resized = (resized - resized.mean()) / (resized.std() + 1e-6)  # per-image normalize;
-    # corpus-level mean/std for final pretraining normalization is computed once
-    # over the full kept corpus, in main() below, not per-image here
-
-    meta["resized_r"] = crop_r * IMG_SIZE / cropped.shape[0]  # radius rescaled
-    # into the final IMG_SIZE frame -- what Stage 3's disk-radius-bounded crop
-    # augmentation should use, not the original-resolution r
-    return resized.astype(np.float32), meta
+    data, meta = load_frame(fits_path)
+    corrected = limb_darkening_correct(data, meta["cx"], meta["cy"], meta["r"], profile)
+    # per-image normalize; note this includes off-disk background pixels (~40%
+    # of the 2048x2048 frame area at r=900), which pulls the mean/std somewhat
+    # toward the background's fixed value -- a known simplification, not fixed
+    # here since it doesn't change frame-to-frame, only a fixed offset/scale.
+    normalized = (corrected - corrected.mean()) / (corrected.std() + 1e-6)
+    return normalized.astype(np.float32), meta
 
 
-def dedup_consecutive(paths_sites_imgs: list[tuple[Path, str, np.ndarray]], threshold: float = DEDUP_THRESHOLD) -> list[Path]:
-    """Per-site stuck-camera dedup: drop a frame if it's nearly identical to
-    the immediately preceding *kept* frame from the same site. Caller must
-    pass frames already sorted by (site, timestamp); `prev_img` is reset on
-    every site change so the last frame of one site is never compared against
-    the first frame of the next (sorting groups files by site folder first,
-    so those two rows are adjacent in the input list -- comparing across that
-    boundary would be comparing two unrelated sites' frames, not a real dup)."""
-    kept = []
-    prev_img = None
-    prev_site = None
-    for path, site, img in paths_sites_imgs:
-        if site != prev_site or prev_img is None or np.abs(img - prev_img).mean() > threshold:
-            kept.append(path)
-            prev_img = img
-            prev_site = site
-    return kept
+class PerSiteDeduper:
+    """Streaming per-site stuck-camera dedup: drop a frame if it's nearly
+    identical to the immediately preceding *kept* frame from the *same* site.
+    Keeps only the last kept image per site in memory (not the whole corpus --
+    at 2048x2048 float32, holding every processed frame at once would be
+    ~167GB for a 10K-image corpus)."""
+
+    def __init__(self, threshold: float = DEDUP_THRESHOLD) -> None:
+        self.threshold = threshold
+        self._prev_by_site: dict[str, np.ndarray] = {}
+
+    def is_duplicate(self, site: str, img: np.ndarray) -> bool:
+        prev = self._prev_by_site.get(site)
+        is_dup = prev is not None and np.abs(img - prev).mean() <= self.threshold
+        if not is_dup:
+            self._prev_by_site[site] = img
+        return is_dup
+
+
+class RunningStats:
+    """Streaming mean/std (single-pass, float64 accumulators) so corpus-level
+    stats don't require holding every image in memory simultaneously."""
+
+    def __init__(self) -> None:
+        self.sum = 0.0
+        self.sumsq = 0.0
+        self.count = 0
+        self.n_images = 0
+
+    def update(self, img: np.ndarray) -> None:
+        self.sum += float(img.sum(dtype=np.float64))
+        self.sumsq += float(np.square(img, dtype=np.float64).sum())
+        self.count += img.size
+        self.n_images += 1
+
+    def finalize(self) -> dict:
+        if self.count == 0:
+            return {"mean": 0.0, "std": 1.0, "n_images": 0}
+        mean = self.sum / self.count
+        var = max(self.sumsq / self.count - mean**2, 0.0)
+        return {"mean": mean, "std": var**0.5, "n_images": self.n_images}
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--raw-dir", type=Path, default=Path("data/raw/gong_pretrain"))
     p.add_argument("--out-dir", type=Path, default=Path("data/processed/gong_pretrain"))
-    p.add_argument("--profile-sample-size", type=int, default=200,
-                   help="number of raw frames used to build the empirical limb-darkening profile")
+    p.add_argument("--profile-sample-size", type=int, default=50,
+                   help="number of raw frames used to build the empirical limb-darkening "
+                        "profile -- kept small since each frame is a full 2048x2048 float32 array")
     args = p.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -190,53 +209,52 @@ def main() -> None:
     # docstring for why this replaced a parametric formula.
     sample_stride = max(1, len(fits_files) // args.profile_sample_size)
     sample_paths = fits_files[::sample_stride][: args.profile_sample_size]
-    sample_crops, sample_r = [], None
+    sample_frames, sample_geom = [], None
     for fp in sample_paths:
         try:
-            cropped, r, _ = load_and_crop(fp)
+            data, geom = load_frame(fp)
         except Exception as e:
             print(f"skip (profile sample) {fp}: {e}")
             continue
-        sample_crops.append(cropped)
-        sample_r = r  # standardized geometry (section 3) -- same r across files
-    profile = compute_radial_profile(sample_crops, sample_r)
+        sample_frames.append(data)
+        sample_geom = geom  # standardized geometry (section 3) -- same for every file
+    profile = compute_radial_profile(sample_frames, sample_geom["cx"], sample_geom["cy"], sample_geom["r"])
     np.save(args.out_dir / "limb_profile.npy", profile)
-    print(f"built limb-darkening profile from {len(sample_crops)} sample frames")
+    print(f"built limb-darkening profile from {len(sample_frames)} sample frames")
     print(f"profile flatness check (pre-correction): {[round(x, 1) for x in profile]}")
+    del sample_frames  # release the sampled full-res frames before pass 2
 
-    # Pass 2: process every frame using that fixed profile.
+    # Pass 2: process every frame using that fixed profile, one at a time.
     manifest_rows = []
-    processed: list[tuple[Path, str, np.ndarray]] = []
+    deduper = PerSiteDeduper()
+    stats = RunningStats()
+    n_dropped = 0
     for fp in fits_files:
         try:
             img, meta = process_one(fp, profile)
         except Exception as e:
             print(f"skip {fp}: {e}")
             continue
+        site = fp.parent.name
+        if deduper.is_duplicate(site, img):
+            n_dropped += 1
+            continue
         out_path = args.out_dir / (fp.stem.replace(".fits", "") + ".npy")
         np.save(out_path, img)
-        site = fp.parent.name
         manifest_rows.append({"path": str(out_path), "site": site, "source": str(fp), **meta})
-        processed.append((out_path, site, img))
-
-    kept_paths = set(dedup_consecutive(processed))
-    manifest_rows = [row for row in manifest_rows if Path(row["path"]) in kept_paths]
-
-    stats = {"mean": 0.0, "std": 1.0, "n_images": 0}
-    if manifest_rows:
-        stacked = np.stack([np.load(row["path"]) for row in manifest_rows])
-        stats = {"mean": float(stacked.mean()), "std": float(stacked.std()), "n_images": len(manifest_rows)}
+        stats.update(img)
 
     with open(args.out_dir / "manifest.csv", "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["path", "site", "source", "cx", "cy", "r", "resized_r"])
+        writer = csv.DictWriter(f, fieldnames=["path", "site", "source", "cx", "cy", "r"])
         writer.writeheader()
         writer.writerows(manifest_rows)
+    final_stats = stats.finalize()
     with open(args.out_dir / "dataset_stats.json", "w") as f:
-        json.dump(stats, f, indent=2)
+        json.dump(final_stats, f, indent=2)
 
     print(f"processed {len(fits_files)} raw files -> {len(manifest_rows)} kept "
-          f"(dropped {len(processed) - len(manifest_rows)} near-duplicates)")
-    print(f"corpus stats: {stats}")
+          f"(dropped {n_dropped} near-duplicates)")
+    print(f"corpus stats: {final_stats}")
 
 
 if __name__ == "__main__":
