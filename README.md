@@ -14,7 +14,7 @@ notebooks) lives on `jp-mvp1` and is intentionally not carried over here. See
 ```
 scripts/pretrain_data/
   gong_halpha.py       # Stage 1: manifest + download GONG H-Alpha FITS (gong2.nso.edu)
-  preprocess_gong.py   # Stage 2: limb-darkening correct, contrast-stretch, dedup -> JPEG (native 2048x2048, 1ch)
+  preprocess_gong.py   # Stage 2: FITS -> JPEG, no other processing (native 2048x2048, 1ch)
 pretrain_gong_kaggle.ipynb   # repo root -- upload this to Kaggle to run both stages
 ```
 

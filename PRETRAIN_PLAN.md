@@ -93,64 +93,50 @@ access — every later stage mounts a Kaggle Dataset instead.
 
 ## 3. Stage 2 — Preprocessing
 
-**Verified against two real downloaded frames** (Big Bear and Mauna Loa,
-2022-03-18), superseding the "confirm header keys" open item:
+**Deliberately minimal by request: FITS → JPEG, no other processing.** An
+earlier revision of this script did limb-darkening correction, a per-image
+percentile contrast stretch, and per-site dedup (all verified against real
+data — see the git history of `scripts/pretrain_data/preprocess_gong.py` for
+that work, including two real bugs it caught: a ring artifact from a
+nearest-bin profile lookup, and a genuine per-site graininess difference
+between Mauna Loa and Big Bear traced to the source data itself). All of that
+was explicitly dropped to keep this stage to the simplest possible format
+conversion. If any of it turns out to be needed later (e.g. Stage 3 wanting
+corpus-level normalization stats, or the per-site quality gap mattering enough
+to address), it's sitting in that history to bring back rather than
+reinvent — not lost, just not run by default.
 
-- GONG's own processing pipeline (the "H Alpha Laminator") already
-  re-registers every "haf" (reduced) product to a **standardized geometry**:
-  disk center at pixel `(1024, 1024)`, radius `900` px, in every `2048×2048`
-  frame — confirmed identical across both sites' samples via the
-  `FNDLMBXC`/`FNDLMBYC`/`FNDLMBMA`/`FNDLMBMI` header keys (found-limb center/
-  major-axis/minor-axis). Disk detection is therefore a matter of *reading*
-  that header geometry, not deriving it via CV — exactly the plan's original
-  intent, now with the real key names filled in. `CRPIX1`/`CRPIX2` + a flat
-  `RADIUS=900` are kept as a fallback only, for the rare frame where the
-  limb-fit keys are missing or malformed.
-- The first limb-darkening attempt used the textbook photospheric-continuum
-  formula `1/(0.3 + 0.7·mu)` — checked against real data with a
-  mean-intensity-per-radial-bin diagnostic, it **overcorrected badly** (the
-  "corrected" profile sloped upward toward the limb instead of flattening).
-  Hα center-to-limb variation is much milder than continuum limb darkening
-  (chromospheric emission, not photospheric), so a generic continuum formula
-  doesn't transfer. Replaced with an **empirical radial profile** — mean
-  intensity per radial bin, computed once from a sample of raw frames — which
-  measurably flattens a real held-out frame's profile (checked: pre-correction
-  ~3206→2457 center-to-limb, post-correction flat at ~3200 throughout).
-- **Output: full native `2048×2048`, 1-channel, 8-bit JPEG — no crop/resize to
-  a smaller pretraining resolution, and no `.npy`.** Verified this matches
-  MAGFiLO's own input convention exactly, not just approximately: a real
-  MAGFiLO training image is itself a `2048×2048`, single-channel (`L` mode)
-  *JPEG*, with the same GONG-style filename and the *same* disk framing — its
-  off-disk corners read exactly `0`, and its limb sits right at radius ~900
-  around `(1024, 1024)`, identical to the raw "haf" product's standardized
-  geometry above. Matching format as well as resolution means there's no
-  train/pretrain mismatch of any kind to bridge at Stage 4 fine-tuning time.
-  JPEG also matters for corpus size: a `2048×2048` float32 `.npy` is ~16.8MB —
-  a 10K-image corpus would be ~168GB, not uploadable as a Kaggle Dataset. A
-  real MAGFiLO JPEG at this resolution is ~700KB (~7GB for 10K images).
-  **Consequence for Stage 3**: a ViT can't operate on the full `2048×2048`
-  frame directly — at patch=16 that's 128×128=16,384 patches (even after MAE's
-  75% masking, ~4,096 visible tokens, ~28× the token count of a 384px/patch=16
-  setup, quadratic in attention cost). Stage 3's dataset instead samples a
-  disk-radius-bounded crop from these full-resolution frames per training
-  step — see section 4.1.
-- **8-bit conversion reuses this project's own prior work**, not a new scheme:
-  `jp-analysis:scripts/apply_contrast_stretch.py` already found (while
-  investigating a per-site photometric gap on the actual MAGFiLO images) that
-  a per-image `[1st, 99th]` percentile clip, computed only over the disk
-  *interior* (rho < 0.85, excluding the limb-brightening annulus) and rescaled
-  to `[0, 255]`, closes that gap. Reused directly here, with the header-based
-  `(cx, cy, r)` from above in place of that script's CV-based disk detection
-  (already known precisely, no need to re-derive it).
-- **Checked real output visually and found real per-site graininess**: Mauna
-  Loa frames come out visibly grainier than Big Bear's. Traced this by
-  comparing the *raw* frame (before any correction) stretched the same way —
-  the graininess is already present pre-correction and pre-limb-darkening, so
-  it's a genuine per-site noise/dynamic-range characteristic of this data
-  (consistent with the photometric gap `apply_contrast_stretch.py` was built
-  to investigate), not a bug introduced by this script. Not addressed further
-  here — flagging it in case Stage 3/4 want a per-site quality weighting or a
-  Mauna-Loa-specific denoise step later.
+What's still verified and kept as free metadata (read, not applied to
+pixels): GONG's own processing pipeline (the "H Alpha Laminator") re-registers
+every "haf" (reduced) product to a **standardized geometry** — disk center at
+pixel `(1024, 1024)`, radius `900` px, in every `2048×2048` frame, confirmed
+identical across both sites' samples via the
+`FNDLMBXC`/`FNDLMBYC`/`FNDLMBMA`/`FNDLMBMI` header keys. `CRPIX1`/`CRPIX2` + a
+flat `RADIUS=900` are kept as a fallback only, for the rare frame where the
+limb-fit keys are missing or malformed.
+
+**Output: full native `2048×2048`, 1-channel, 8-bit JPEG.** Verified this
+matches MAGFiLO's own input convention exactly, not just approximately: a real
+MAGFiLO training image is itself a `2048×2048`, single-channel (`L` mode)
+*JPEG*, with the same GONG-style filename and the *same* disk framing — its
+off-disk corners read exactly `0`, and its limb sits right at radius ~900
+around `(1024, 1024)`, identical to the raw "haf" product's standardized
+geometry above. Matching format as well as resolution means there's no
+train/pretrain mismatch of any kind to bridge at Stage 4 fine-tuning time.
+JPEG also matters for corpus size: a `2048×2048` float32 `.npy` (the earlier
+revision's format) is ~16.8MB — a 10K-image corpus would be ~168GB, not
+uploadable as a Kaggle Dataset. A real MAGFiLO JPEG at this resolution is
+~700KB (~7GB for 10K images); this script's own 8-bit-min-max output measured
+similarly (~500KB/frame on 20 real files).
+
+**Consequence for Stage 3**: a ViT can't operate on the full `2048×2048` frame
+directly — at patch=16 that's 128×128=16,384 patches (even after MAE's 75%
+masking, ~4,096 visible tokens, ~28× the token count of a 384px/patch=16
+setup, quadratic in attention cost). Stage 3's dataset still needs to sample a
+disk-radius-bounded crop from these full-resolution frames per training
+step — see section 4.1. Since there's no `dataset_stats.json` anymore either,
+Stage 3's normalization needs a different source (compute it once itself, or
+just divide by 255) — noted in the open items list.
 
 Implementation: `scripts/pretrain_data/preprocess_gong.py`, run once over the
 downloaded corpus:
@@ -160,25 +146,12 @@ python scripts/pretrain_data/preprocess_gong.py \
     --raw-dir data/raw/gong_pretrain --out-dir data/processed/gong_pretrain
 ```
 
-Two passes: (1) samples `--profile-sample-size` frames (default 50 — kept
-small since each sampled frame is a full `2048×2048` float32 array, ~16.8MB) to
-build one shared empirical limb-darkening profile (`limb_profile.npy`, a small
-1D array — the only remaining `.npy` in this pipeline), printing the
-pre-correction profile so a wildly non-monotonic result is visible
-immediately; (2) processes every frame — limb-darkening correct (at full
-native resolution, using the header's own `cx`/`cy`/`r`, interpolating the
-profile between bin centers rather than a nearest-bin lookup, which produced
-visible concentric ring artifacts when first tried) → percentile-clip
-contrast-stretch to 8-bit → per-site stuck-camera dedup (frame-differencing on
-the final `[0,255]` scale, threshold tuned empirically against real
-distinct-hour frames — see the script's `DEDUP_THRESHOLD` comment) →
-corpus-level mean/std over the kept set (`dataset_stats.json`, now over the
-`[0,255]` domain), which Stage 3's dataloader should normalize with instead of
-ImageNet stats. Both the dedup and the corpus-stats pass are streaming (one
-frame in memory at a time, plus one running "previous frame" per site) rather
-than stacking the whole corpus into one array. Output: one JPEG per kept frame
-(native `2048×2048`, 8-bit, quality 95) plus `manifest.csv` (path, site, disk
-center/radius in the frame's own native pixel coordinates).
+One pass, per frame: read the FITS data → linearly rescale *that image's own*
+min/max to `[0, 255]` (the only unavoidable step to fit 16-bit data into an
+8-bit JPEG at all — not an adaptive/astronomy-specific stretch) → save as
+JPEG (quality 95) → record `(cx, cy, r)` in `manifest.csv` as metadata. Ran
+against 20 real downloaded frames (both sites) — all 20 converted, off-disk
+background reads exactly 0, filament threads and plage visible, no artifacts.
 
 Save output as Kaggle Dataset `halpha-preprocessed` — every future pretraining
 session mounts this read-only, no re-downloading or re-processing.
@@ -195,22 +168,18 @@ and normalizing with the corpus stats, not just loading a pre-sized image:
 
 ```python
 # dataset.py
-import json
 import numpy as np, pandas as pd, torch, random
 from PIL import Image
 from torch.utils.data import Dataset
 
 class HalphaMAEDataset(Dataset):
-    def __init__(self, manifest_csv, stats_json, crop_size=384, train=True):
+    def __init__(self, manifest_csv, crop_size=384, train=True):
         manifest = pd.read_csv(manifest_csv)
         self.paths = manifest["path"].tolist()
         self.cx = manifest["cx"].tolist()
         self.cy = manifest["cy"].tolist()
         self.r = manifest["r"].tolist()  # disk radius, in the *native* 2048x2048
         # frame -- Stage 2 doesn't resize, so no rescaling needed here
-        stats = json.load(open(stats_json))  # dataset_stats.json from Stage 2 --
-        self.mean, self.std = stats["mean"], stats["std"]  # over [0,255], not
-        # ImageNet stats -- these are this corpus's own values
         self.crop_size = crop_size
         self.train = train
 
@@ -218,8 +187,11 @@ class HalphaMAEDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, idx):
-        img = np.array(Image.open(self.paths[idx]), dtype=np.float32)
-        img = (img - self.mean) / (self.std + 1e-6)
+        img = np.array(Image.open(self.paths[idx]), dtype=np.float32) / 255.0
+        # Stage 2 no longer computes corpus-level mean/std (it does nothing but
+        # convert FITS -> JPEG now), so there's no dataset_stats.json to load
+        # here -- dividing by 255 is a placeholder until Stage 3 either computes
+        # its own corpus stats or this normalization gets revisited.
         img = self._disk_bounded_crop(img, self.cx[idx], self.cy[idx], self.r[idx])
         if self.train:
             img = self._augment(img)
@@ -485,14 +457,21 @@ Launch cell:
       section 2.
 - [x] FITS header keys for disk center/radius — verified against real Big Bear
       and Mauna Loa frames, see section 3.
-- [x] Limb-darkening correction — the parametric formula failed a real flatness
-      check and was replaced with an empirical profile, see section 3.
-- [x] Output resolution/channels — kept native `2048×2048`, 1-channel,
-      verified to match MAGFiLO's own training images exactly, see section 3.
+- [x] Limb-darkening correction, contrast stretch, dedup — all implemented and
+      verified against real data, then deliberately dropped by request to keep
+      Stage 2 to a plain FITS→JPEG conversion. See section 3 and this file's
+      git history if any of it needs reviving.
+- [x] Output resolution/channels/format — kept native `2048×2048`, 1-channel,
+      JPEG, verified to match MAGFiLO's own training images exactly, see
+      section 3.
 - [ ] Decide ViT-Small vs. ViT-Base from the first session's measured
       images/sec at each scale on 2×T4, not up front.
+- [ ] Pick a normalization source for Stage 3 now that Stage 2 doesn't compute
+      corpus stats — `HalphaMAEDataset` above just divides by 255 as a
+      placeholder; decide whether that's good enough or Stage 3 should compute
+      its own mean/std pass first.
 - [ ] Verify `HalphaMAEDataset._disk_bounded_crop` (section 4.1) against real
-      `.npy` frames once Stage 3 is actually implemented — it's still
+      JPEG frames once Stage 3 is actually implemented — it's still
       illustrative pseudocode, unlike Stages 1-2's tested scripts.
 - [ ] Pick a `crop_size` (default 384 above) against the ViT patch size chosen
       in section 4.2 — this is now decoupled from Stage 2's output resolution,
