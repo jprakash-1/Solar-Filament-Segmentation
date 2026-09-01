@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Stage 2: limb-darkening correct, dedup, and normalize downloaded GONG H-Alpha
-FITS frames, keeping the full native 2048x2048, 1-channel frame -- matching
-MAGFiLO's own input convention exactly (verified: a real MAGFiLO training image
-is itself a 2048x2048, single-channel (`L` mode) image, with the same
-GONG-style filename and the same disk center/radius framing -- off-disk corners
-read exactly 0, and the limb sits right at radius ~900 around (1024, 1024), the
-same standardized geometry as the raw "haf" product below). No resize/crop to a
-smaller pretraining resolution, so there's no train/pretrain resolution
-mismatch to bridge at Stage 4 fine-tuning time.
+"""Stage 2: limb-darkening correct, contrast-stretch to 8-bit, dedup, and save
+downloaded GONG H-Alpha FITS frames as JPEGs -- keeping the full native
+2048x2048, 1-channel frame, matching MAGFiLO's own input convention exactly
+(verified: a real MAGFiLO training image is itself a 2048x2048, single-channel
+(`L` mode) *JPEG*, with the same GONG-style filename and the same disk
+center/radius framing -- off-disk corners read exactly 0, and the limb sits
+right at radius ~900 around (1024, 1024), the same standardized geometry as
+the raw "haf" product below). No resize/crop to a smaller pretraining
+resolution, so there's no train/pretrain resolution mismatch to bridge at
+Stage 4 fine-tuning time, and no format mismatch either.
 
 Verified against real files (see PRETRAIN_PLAN.md section 3): GONG's own
 processing pipeline already re-registers every "haf" (reduced) frame to that
@@ -17,6 +18,20 @@ holds across sites (checked Big Bear and Mauna Loa samples), so disk geometry
 here is read from the header, not derived via CV. `CRPIX1`/`CRPIX2` + a flat
 `RADIUS=900` are kept as a fallback only, in case a future frame's limb-fit
 keys are missing or malformed.
+
+The 8-bit contrast stretch (percentile clip over the disk *interior*, then
+rescale to [0, 255]) reuses the exact approach already validated on this
+project's `jp-analysis` branch (`scripts/apply_contrast_stretch.py`), which
+found a naive full-disk percentile stretch anchors on the limb-brightening
+artifact near the edge and closes a real per-site photometric gap once
+restricted to the interior 85% of the disk radius. That script re-detects
+disk geometry via CV; here the header-based (cx, cy, r) from section 3 is used
+directly instead, since it's already known precisely.
+
+Storing as JPEG (not .npy) matters at this corpus size too: a 2048x2048
+float32 .npy is ~16.8MB/frame -- a 10K-image corpus would be ~168GB, clearly
+not uploadable as a Kaggle Dataset. A real MAGFiLO JPEG at this resolution is
+~700KB, i.e. ~7GB for 10K images.
 
 Note for Stage 3: a ViT operating on the full 2048x2048 frame directly is not
 feasible on 2xT4 -- at patch=16 that's 128x128=16384 patches (even after MAE's
@@ -39,16 +54,23 @@ from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
+from PIL import Image
 
-DEDUP_THRESHOLD = 0.01  # mean abs difference is measured *after* per-image
-# z-score normalization (mean 0, std 1), so this is on a normalized scale, not
-# raw pixel counts. Calibrated against two real, genuinely-different-hour Big
-# Bear frames, which differed by ~0.02-0.06 on this scale -- a stuck-camera
-# repeat (byte-identical source data) differs by ~1e-7 (floating-point noise
-# only), so 0.01 sits comfortably between the two without needing a higher
-# threshold that would risk treating legitimately different hours as dups.
+DEDUP_THRESHOLD = 2.0  # mean abs difference on the final 8-bit [0,255] scale.
+# Calibrated against 20 real downloaded frames (both sites): genuinely
+# different-hour frames differed by ~20-42 on this scale for both Big Bear and
+# Mauna Loa; an identical file compared against itself differs by exactly 0
+# (a real stuck-camera repeat -- byte-identical source data -- would land
+# here). 2.0 sits comfortably below the real-difference range without needing
+# to be right at 0, leaving margin for JPEG re-encoding not being perfectly
+# bit-exact run-to-run.
 
 N_PROFILE_BINS = 32
+CONTRAST_LOW_PCT = 1.0
+CONTRAST_HIGH_PCT = 99.0
+CONTRAST_INTERIOR_FRAC = 0.85  # fraction of disk radius treated as artifact-free
+# interior for the percentile stretch -- excludes the outer annulus where
+# limb-brightening lives, matching jp-analysis:scripts/apply_contrast_stretch.py
 
 
 def read_disk_geometry(header: fits.Header) -> tuple[float, float, float]:
@@ -143,23 +165,39 @@ def load_frame(fits_path: Path) -> tuple[np.ndarray, dict]:
     return data, {"cx": cx, "cy": cy, "r": r}
 
 
+def contrast_stretch_to_uint8(img: np.ndarray, cx: float, cy: float, r: float,
+                               low_pct: float = CONTRAST_LOW_PCT, high_pct: float = CONTRAST_HIGH_PCT,
+                               interior_frac: float = CONTRAST_INTERIOR_FRAC) -> np.ndarray:
+    """Per-image percentile clip + rescale to [0, 255], matching MAGFiLO's own
+    8-bit JPEG format. Percentiles are computed only over the disk *interior*
+    (rho < interior_frac), not the whole disk or frame -- anchoring on the
+    outer annulus (where limb-brightening/the correction's own edge effects
+    live) or the off-disk background would waste dynamic range on artifacts
+    instead of the actual filament-relevant texture. Off-disk pixels are set
+    to exactly 0 after stretching, matching real MAGFiLO images' corners."""
+    rho = _rho_grid(img.shape, cx, cy, r)
+    on_disk = rho < 1.0
+    interior = on_disk & (rho < interior_frac)
+    lo, hi = np.percentile(img[interior], [low_pct, high_pct])
+    stretched = np.clip((img - lo) / max(hi - lo, 1e-6) * 255.0, 0, 255)
+    out = np.zeros_like(stretched, dtype=np.uint8)
+    out[on_disk] = stretched[on_disk].astype(np.uint8)
+    return out
+
+
 def process_one(fits_path: Path, profile: np.ndarray) -> tuple[np.ndarray, dict]:
     data, meta = load_frame(fits_path)
     corrected = limb_darkening_correct(data, meta["cx"], meta["cy"], meta["r"], profile)
-    # per-image normalize; note this includes off-disk background pixels (~40%
-    # of the 2048x2048 frame area at r=900), which pulls the mean/std somewhat
-    # toward the background's fixed value -- a known simplification, not fixed
-    # here since it doesn't change frame-to-frame, only a fixed offset/scale.
-    normalized = (corrected - corrected.mean()) / (corrected.std() + 1e-6)
-    return normalized.astype(np.float32), meta
+    stretched = contrast_stretch_to_uint8(corrected, meta["cx"], meta["cy"], meta["r"])
+    return stretched, meta
 
 
 class PerSiteDeduper:
     """Streaming per-site stuck-camera dedup: drop a frame if it's nearly
     identical to the immediately preceding *kept* frame from the *same* site.
     Keeps only the last kept image per site in memory (not the whole corpus --
-    at 2048x2048 float32, holding every processed frame at once would be
-    ~167GB for a 10K-image corpus)."""
+    at 2048x2048, holding every processed frame at once would use significant
+    memory even at 1 byte/pixel for a 10K-image corpus)."""
 
     def __init__(self, threshold: float = DEDUP_THRESHOLD) -> None:
         self.threshold = threshold
@@ -167,7 +205,10 @@ class PerSiteDeduper:
 
     def is_duplicate(self, site: str, img: np.ndarray) -> bool:
         prev = self._prev_by_site.get(site)
-        is_dup = prev is not None and np.abs(img - prev).mean() <= self.threshold
+        # cast to a signed dtype before differencing -- img/prev are uint8, and
+        # unsigned subtraction wraps around (e.g. 5 - 200 -> 61, not -195)
+        # instead of going negative, which would silently corrupt this check
+        is_dup = prev is not None and np.abs(img.astype(np.int16) - prev.astype(np.int16)).mean() <= self.threshold
         if not is_dup:
             self._prev_by_site[site] = img
         return is_dup
@@ -246,8 +287,8 @@ def main() -> None:
         if deduper.is_duplicate(site, img):
             n_dropped += 1
             continue
-        out_path = args.out_dir / (fp.stem.replace(".fits", "") + ".npy")
-        np.save(out_path, img)
+        out_path = args.out_dir / (fp.stem.replace(".fits", "") + ".jpeg")
+        Image.fromarray(img, mode="L").save(out_path, quality=95)
         manifest_rows.append({"path": str(out_path), "site": site, "source": str(fp), **meta})
         stats.update(img)
 
