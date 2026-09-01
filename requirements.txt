@@ -11,6 +11,11 @@ matplotlib
 seaborn
 tqdm
 
+# Pretraining data acquisition/preprocessing (GONG H-Alpha)
+requests
+beautifulsoup4
+astropy
+
 # Deep learning
 torch
 torchvision

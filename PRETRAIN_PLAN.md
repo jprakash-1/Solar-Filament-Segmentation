@@ -40,145 +40,104 @@ corpus covers both quiet-sun and active-sun phases of solar cycle 25 (started
 ~Dec 2019; recent active/max period ~2023-2025) rather than skewing toward one
 filament-density regime.
 
-**Action items to resolve before running this at scale** (skeleton below has
-placeholders for exactly these):
+**Verified directly against the live archive** (superseding the "browse it
+manually first" open item from the previous revision of this plan):
 
-- Browse the real GONG/BBSO Hα archive tree for `big_bear_halpha/` and
-  `mauna_loa_halpha/` once manually to confirm the actual year/month/day folder
-  structure and filename pattern — layouts differ slightly between GONG products
-  and sites, so don't assume the skeleton's path guess is right.
-- Confirm the `sunpy.net.Fido` alternative resolves GONG Hα queries cleanly with a
-  small date-range test query before committing to a bulk pull — if it works
-  cleanly, prefer it over hand-rolled directory scraping.
+- Base URL: `https://gong2.nso.edu/HA/haf/<YYYYMM>/<YYYYMMDD>/` — a plain
+  Apache-style directory listing, confirmed with a real `requests.get()`, no
+  authentication needed.
+- Filenames: `<YYYYMMDDHHMMSS><site-letter>h.fits.fz`, e.g.
+  `20220318000050Bh.fits.fz`. Single-letter site codes (confirmed from a real
+  listing, **not** the two-letter codes used by the archive's separate
+  query-form UI): `B`=Big Bear, `M`=Mauna Loa, `L`=Learmonth, `U`=Udaipur,
+  `T`=Teide.
+- The listing page also embeds a zero-font-size decoy link (a bot-trap) —
+  `scripts/pretrain_data/gong_halpha.py` filters strictly to `.fits.fz` hrefs
+  matching the expected filename shape, which already excludes it; don't loosen
+  that filter to something broader.
+- Per-site cadence within the archive is roughly ~1/minute during that site's
+  local daytime — nothing near-continuous to worry about, and nothing at all
+  outside daylight hours (these are ground telescopes; a site only sees the Sun
+  during its own local day). Big Bear and Mauna Loa's daylight windows overlap
+  only partially, which is the actual mechanism behind "day/night complementary
+  coverage."
 
-```python
-# acquire_gong_halpha.py
-import os, requests
-from pathlib import Path
-from bs4 import BeautifulSoup
+Implementation: `scripts/pretrain_data/gong_halpha.py`, run in two steps (manifest
+first, review it, then download):
 
-SITES = ["big_bear_halpha", "mauna_loa_halpha"]  # start with 2 sites
-BASE_URL = "https://iswa.ccmc.gsfc.nasa.gov/iswa_data_tree/observation/solar/gong/{site}/"
-OUT_DIR = Path("/kaggle/working/halpha_raw")
-CADENCE_HOURS = 1  # subsample -- GONG native cadence is ~20s, don't pull all of it
+```bash
+python scripts/pretrain_data/gong_halpha.py manifest \
+    --sites big_bear mauna_loa \
+    --date-ranges 2019-06-01:2020-06-01 2023-06-01:2024-06-01 \
+    --day-stride 3 --max-images 10000 \
+    --out data/raw/gong_pretrain/manifest.csv
 
-# quiet-sun and active-sun windows of solar cycle 25 -- adjust once the corpus
-# budget (5-10K images / 2 sites / ~1 frame-per-hour) is actually planned out
-DATE_RANGES = [
-    ("2019-06-01", "2020-06-01"),  # quiet
-    ("2023-06-01", "2024-06-01"),  # active
-]
-
-def list_dir(url: str) -> list[str]:
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    return [a["href"] for a in soup.find_all("a") if a["href"].endswith(("/", ".fits", ".jpg"))]
-
-def download_site(site: str, date_ranges: list[tuple[str, str]]) -> None:
-    (OUT_DIR / site).mkdir(parents=True, exist_ok=True)
-    base = BASE_URL.format(site=site)
-    for entry in list_dir(base):
-        # directory structure is typically year/month/day -- confirm the real
-        # listing once (see action items above) and fill in the date-filtered
-        # recursive walk here, respecting CADENCE_HOURS and DATE_RANGES.
-        pass  # skeleton -- do not run against date ranges/paths until verified
-
-if __name__ == "__main__":
-    for site in SITES:
-        download_site(site, DATE_RANGES)
+python scripts/pretrain_data/gong_halpha.py download \
+    --manifest data/raw/gong_pretrain/manifest.csv \
+    --out-dir data/raw/gong_pretrain
 ```
 
-Once populated: run it, then in the Kaggle UI **New Dataset → upload
-`/kaggle/working/halpha_raw` → version it** as `halpha-raw`. This is the only stage
-that needs internet access — every later stage mounts a Kaggle Dataset instead.
+`--day-stride 3` (sample every 3rd day) is the default because 2 sites' combined
+daylight coverage is ~15-20 frames/day, and continuous daily coverage across two
+full-year windows would produce ~20-25K frames — well over the 5-10K target.
+Tune it once the manifest's row count comes back (rerun `manifest` with a
+different stride until the count lands in range; it's cheap, no download yet).
+Downloading is resume-safe (skips files already on disk) so a killed Kaggle
+session can just rerun the same command.
+
+Once downloaded: in the Kaggle UI, **New Dataset → upload the output directory →
+version it** as `halpha-raw`. This is the only stage that needs internet
+access — every later stage mounts a Kaggle Dataset instead.
 
 ---
 
 ## 3. Stage 2 — Preprocessing
 
-```python
-# preprocess_halpha.py
-import numpy as np, pandas as pd, os
-from astropy.io import fits
-from pathlib import Path
-import cv2
+**Verified against two real downloaded frames** (Big Bear and Mauna Loa,
+2022-03-18), superseding the "confirm header keys" open item:
 
-RAW_DIR = "/kaggle/input/halpha-raw"
-OUT_DIR = "/kaggle/working/halpha_preprocessed"
-IMG_SIZE = 384  # multiple of ViT patch size (16) -- revisit against the eventual
-                # encoder's patch size before running at scale
+- GONG's own processing pipeline (the "H Alpha Laminator") already
+  re-registers every "haf" (reduced) product to a **standardized geometry**:
+  disk center at pixel `(1024, 1024)`, radius `900` px, in every `2048×2048`
+  frame — confirmed identical across both sites' samples via the
+  `FNDLMBXC`/`FNDLMBYC`/`FNDLMBMA`/`FNDLMBMI` header keys (found-limb center/
+  major-axis/minor-axis). Disk detection is therefore a matter of *reading*
+  that header geometry, not deriving it via CV — exactly the plan's original
+  intent, now with the real key names filled in. `CRPIX1`/`CRPIX2` + a flat
+  `RADIUS=900` are kept as a fallback only, for the rare frame where the
+  limb-fit keys are missing or malformed.
+- The first limb-darkening attempt used the textbook photospheric-continuum
+  formula `1/(0.3 + 0.7·mu)` — checked against real data with a
+  mean-intensity-per-radial-bin diagnostic, it **overcorrected badly** (the
+  "corrected" profile sloped upward toward the limb instead of flattening).
+  Hα center-to-limb variation is much milder than continuum limb darkening
+  (chromospheric emission, not photospheric), so a generic continuum formula
+  doesn't transfer. Replaced with an **empirical radial profile** — mean
+  intensity per radial bin, computed once from a sample of raw frames — which
+  measurably flattens a real held-out frame's profile (checked: pre-correction
+  ~3206→2457 center-to-limb, post-correction flat at ~3200 throughout).
 
-def limb_darkening_correct(img, cx, cy, r):
-    yy, xx = np.mgrid[0:img.shape[0], 0:img.shape[1]]
-    rho = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / r
-    rho = np.clip(rho, 0, 0.999)
-    mu = np.sqrt(1 - rho ** 2)
-    correction = 1.0 / (0.3 + 0.7 * mu)  # simple linear limb-darkening model;
-    # tune the 0.3/0.7 coefficients against a handful of real frames -- check that
-    # mean intensity vs. radius is flat post-correction before trusting this at scale
-    return img * correction
+Implementation: `scripts/pretrain_data/preprocess_gong.py`, run once over the
+downloaded corpus:
 
-def process_one(fits_path: Path, out_dir: str, manifest_rows: list[dict]) -> None:
-    with fits.open(fits_path) as hdul:
-        data = hdul[0].data.astype(np.float32)
-        hdr = hdul[0].header
-        # CRPIX1/2, SOLAR_R are placeholders -- confirm the actual header keys on
-        # real pulled files before trusting these; GONG's disk-center/radius key
-        # names are not yet verified against a real sample in this environment.
-        cx = hdr.get("CRPIX1", data.shape[1] / 2)
-        cy = hdr.get("CRPIX2", data.shape[0] / 2)
-        r = hdr.get("SOLAR_R", min(data.shape) / 2.2)
-
-    data = limb_darkening_correct(data, cx, cy, r)
-    data = cv2.resize(data, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
-    data = (data - data.mean()) / (data.std() + 1e-6)  # per-image normalize here;
-    # dataset-level mean/std for final pretraining normalization is computed
-    # separately below, over the *kept* (post-dedup) corpus, not this per-image pass
-
-    out_path = Path(out_dir) / (fits_path.stem + ".npy")
-    np.save(out_path, data.astype(np.float32))
-    manifest_rows.append({"path": str(out_path), "cx": cx, "cy": cy, "r": r})
-    # r is carried into the manifest so Stage 3's augmentation can bound random
-    # crops to the disk radius instead of risking a crop that's mostly off-disk
-
-def dedup_near_identical(paths: list[str], threshold: float = 2.0) -> list[str]:
-    # frame-differencing dedup -- fine at ~1 frame/hour where "near-identical" is
-    # really about a stuck camera repeating a frame during an outage, not natural
-    # minute-to-minute similarity. Switch to a perceptual hash (imagehash pHash/
-    # dHash) if the corpus grows to a cadence where naive diffing gets slow.
-    kept = []
-    prev = None
-    for p in paths:
-        img = np.load(p)
-        if prev is None or np.abs(img - prev).mean() > threshold:
-            kept.append(p)
-            prev = img
-    return kept
-
-if __name__ == "__main__":
-    os.makedirs(OUT_DIR, exist_ok=True)
-    manifest_rows: list[dict] = []
-    for f in Path(RAW_DIR).rglob("*.fits"):
-        try:
-            process_one(f, OUT_DIR, manifest_rows)
-        except Exception as e:
-            print(f"skip {f}: {e}")
-
-    df = pd.DataFrame(manifest_rows)
-    kept_paths = dedup_near_identical(df["path"].tolist())
-    df = df[df["path"].isin(kept_paths)]
-
-    mean, std = 0.0, 1.0
-    if len(df):
-        stacked = np.stack([np.load(p) for p in df["path"]])
-        mean, std = float(stacked.mean()), float(stacked.std())
-    df.to_csv(f"{OUT_DIR}/manifest.csv", index=False)
-    with open(f"{OUT_DIR}/dataset_stats.json", "w") as f:
-        import json
-        json.dump({"mean": mean, "std": std, "n_images": len(df)}, f)
-    print(f"Final dataset: {len(df)} images, mean={mean:.4f}, std={std:.4f}")
+```bash
+python scripts/pretrain_data/preprocess_gong.py \
+    --raw-dir data/raw/gong_pretrain --out-dir data/processed/gong_pretrain
 ```
+
+Two passes: (1) samples `--profile-sample-size` frames (default 200) to build
+one shared empirical limb-darkening profile (`limb_profile.npy`), printing the
+pre-correction profile so a wildly non-monotonic result is visible immediately;
+(2) processes every frame — disk-crop via header geometry → limb-darkening
+correct → resize to `IMG_SIZE` (384, a multiple of ViT patch size 16) →
+per-image z-score normalize → per-site stuck-camera dedup (frame-differencing,
+threshold tuned empirically on normalized-scale data — see the script's
+`DEDUP_THRESHOLD` comment) → corpus-level mean/std over the kept set
+(`dataset_stats.json`), which Stage 3's dataloader should normalize with
+instead of ImageNet stats. Output: one `.npy` per kept frame plus
+`manifest.csv` (path, site, disk center/radius, and `resized_r` — the disk
+radius rescaled into the final `IMG_SIZE` frame, which Stage 3's
+disk-radius-bounded crop augmentation needs).
 
 Save output as Kaggle Dataset `halpha-preprocessed` — every future pretraining
 session mounts this read-only, no re-downloading or re-processing.
@@ -448,20 +407,21 @@ Launch cell:
 
 ## 6. Open items to fill in before running
 
-- [ ] Confirm the actual GONG/BBSO directory and date structure by browsing
-      `big_bear_halpha/` once manually (or verify the `sunpy.net.Fido` path works
-      cleanly instead).
-- [ ] Confirm the real FITS header keys for disk center/radius on actual pulled
-      files (`CRPIX1/2`, `SOLAR_R` above are placeholders).
-- [ ] Tune the limb-darkening correction coefficients against a few sample images
-      visually (check mean-intensity-vs-radius is flat post-correction).
+- [x] GONG archive URL/directory structure and site codes — verified live, see
+      section 2.
+- [x] FITS header keys for disk center/radius — verified against real Big Bear
+      and Mauna Loa frames, see section 3.
+- [x] Limb-darkening correction — the parametric formula failed a real flatness
+      check and was replaced with an empirical profile, see section 3.
 - [ ] Decide ViT-Small vs. ViT-Base from the first session's measured
       images/sec at each scale on 2×T4, not up front.
-- [ ] Implement the disk-radius-bounded crop in `_augment()` — the manifest already
-      carries `r` per image (Stage 2) specifically so this doesn't need a second
-      data pass later.
+- [ ] Implement the disk-radius-bounded crop in Stage 3's `_augment()` — the
+      manifest already carries `resized_r` per image (Stage 2) specifically so
+      this doesn't need a second data pass later.
 - [ ] Pick `SESSION_BUDGET_SECONDS` against the actual per-session cap Kaggle grants
       the account (varies by verification tier) rather than assuming 8h flat.
+- [ ] Tune `--day-stride` / `--max-images` once a real manifest is built, so the
+      final downloaded corpus actually lands in the 5-10K target range.
 
 Pretraining is complete once Stage 3's masked-reconstruction quality plateaus
 (loss curve + visual check) and the Stage 4 ablation shows the MAE-pretrained
