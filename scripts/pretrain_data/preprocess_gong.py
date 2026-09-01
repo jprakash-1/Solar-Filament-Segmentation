@@ -14,6 +14,10 @@ this file for how that was verified) and carried into the manifest as plain
 metadata, since they're free to read and may be useful later -- they are not
 applied to the pixels here.
 
+Multi-process (CPU-bound: FITS decompression + array math + JPEG encoding,
+not I/O-bound like Stage 1) via ProcessPoolExecutor. `--processes` defaults to
+the machine's CPU count.
+
 Usage:
     python scripts/pretrain_data/preprocess_gong.py \
         --raw-dir data/raw/gong_pretrain --out-dir data/processed/gong_pretrain
@@ -23,11 +27,43 @@ from __future__ import annotations
 
 import argparse
 import csv
+import logging
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
 from PIL import Image
+
+logger = logging.getLogger("preprocess_gong")
+
+
+def setup_logging(log_file: Path | None = None, level: int = logging.INFO) -> None:
+    logger.setLevel(level)
+    logger.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+
+def _init_worker() -> None:
+    # Each worker process needs its own logging config -- it doesn't inherit
+    # the main process's handlers under the 'spawn' start method (macOS/
+    # Windows default). Console-only here; the main process aggregates
+    # progress from returned results, so per-worker file logging isn't needed.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s [%(levelname)s] %(processName)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
 
 def read_disk_geometry(header: fits.Header) -> tuple[float, float, float]:
@@ -68,35 +104,72 @@ def process_one(fits_path: Path) -> tuple[np.ndarray, dict]:
     return to_uint8(data), meta
 
 
+def _process_and_save(fits_path_str: str, out_dir_str: str) -> dict | None:
+    """Runs in a worker process: convert one FITS file and save it, returning
+    only the lightweight manifest row (not the pixel array) back to the main
+    process."""
+    fits_path = Path(fits_path_str)
+    out_dir = Path(out_dir_str)
+    try:
+        img, meta = process_one(fits_path)
+    except Exception as e:
+        logging.warning(f"skip {fits_path}: {e}")
+        return None
+    site = fits_path.parent.name
+    out_path = out_dir / (fits_path.stem.replace(".fits", "") + ".jpeg")
+    Image.fromarray(img, mode="L").save(out_path, quality=95)
+    return {"path": str(out_path), "site": site, "source": str(fits_path), **meta}
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--raw-dir", type=Path, default=Path("data/raw/gong_pretrain"))
     p.add_argument("--out-dir", type=Path, default=Path("data/processed/gong_pretrain"))
+    p.add_argument("--processes", type=int, default=os.cpu_count(), help="worker processes (CPU-bound work)")
+    p.add_argument("--progress-every", type=int, default=50)
+    p.add_argument("--log-file", type=Path, default=None)
     args = p.parse_args()
+    setup_logging(args.log_file)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     fits_files = sorted(args.raw_dir.rglob("*.fits.fz")) + sorted(args.raw_dir.rglob("*.fits"))
     if not fits_files:
         raise SystemExit(f"no .fits/.fits.fz files found under {args.raw_dir}")
+    total = len(fits_files)
+    logger.info(f"converting {total} files using {args.processes} processes")
 
     manifest_rows = []
-    for fp in fits_files:
-        try:
-            img, meta = process_one(fp)
-        except Exception as e:
-            print(f"skip {fp}: {e}")
-            continue
-        site = fp.parent.name
-        out_path = args.out_dir / (fp.stem.replace(".fits", "") + ".jpeg")
-        Image.fromarray(img, mode="L").save(out_path, quality=95)
-        manifest_rows.append({"path": str(out_path), "site": site, "source": str(fp), **meta})
+    n_failed = 0
+    completed = 0
+    start_time = time.monotonic()
+
+    with ProcessPoolExecutor(max_workers=args.processes, initializer=_init_worker) as executor:
+        futures = {
+            executor.submit(_process_and_save, str(fp), str(args.out_dir)): fp
+            for fp in fits_files
+        }
+        for future in as_completed(futures):
+            row = future.result()
+            completed += 1
+            if row is None:
+                n_failed += 1
+            else:
+                manifest_rows.append(row)
+            if completed % args.progress_every == 0 or completed == total:
+                elapsed = time.monotonic() - start_time
+                rate = elapsed / completed
+                remaining = rate * (total - completed)
+                logger.info(
+                    f"[{completed}/{total}] converted={len(manifest_rows)} failed={n_failed} -- "
+                    f"elapsed {elapsed / 60:.1f}min, ~{remaining / 60:.1f}min remaining"
+                )
 
     with open(args.out_dir / "manifest.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["path", "site", "source", "cx", "cy", "r"])
         writer.writeheader()
         writer.writerows(manifest_rows)
 
-    print(f"converted {len(manifest_rows)}/{len(fits_files)} raw files to JPEG")
+    logger.info(f"converted {len(manifest_rows)}/{total} raw files to JPEG ({n_failed} failed)")
 
 
 if __name__ == "__main__":

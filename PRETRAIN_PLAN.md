@@ -69,12 +69,13 @@ first, review it, then download):
 python scripts/pretrain_data/gong_halpha.py manifest \
     --sites big_bear mauna_loa \
     --date-ranges 2019-06-01:2020-06-01 2023-06-01:2024-06-01 \
-    --day-stride 3 --max-images 10000 \
-    --out data/raw/gong_pretrain/manifest.csv
+    --day-stride 3 --max-images 10000 --workers 6 \
+    --out data/raw/gong_pretrain/manifest.csv \
+    --log-file data/raw/gong_pretrain/manifest_build.log
 
 python scripts/pretrain_data/gong_halpha.py download \
     --manifest data/raw/gong_pretrain/manifest.csv \
-    --out-dir data/raw/gong_pretrain
+    --out-dir data/raw/gong_pretrain --workers 6
 ```
 
 `--day-stride 3` (sample every 3rd day) is the default because 2 sites' combined
@@ -84,6 +85,23 @@ Tune it once the manifest's row count comes back (rerun `manifest` with a
 different stride until the count lands in range; it's cheap, no download yet).
 Downloading is resume-safe (skips files already on disk) so a killed Kaggle
 session can just rerun the same command.
+
+**Concurrency and logging**: both `manifest` and `download` are multi-threaded
+(`--workers`, default 4) — this is I/O-bound (network requests), not CPU work,
+so threads rather than processes. Each worker thread gets its own
+`requests.Session` (thread-local) rather than sharing one. This mattered in
+practice: a first real run of the full date range (sequential, before
+threading) sat for nearly an hour with no visible progress, because the only
+progress signal was the final row count printed at completion — there was no
+way to tell whether it was almost done or stuck. `--log-file` now streams a
+running `[completed/total] N frames so far -- elapsed Xmin, ~Ymin remaining`
+line (also written to the manifest CSV path as a periodic checkpoint during
+`manifest`, so a killed run still leaves a real partial result instead of
+nothing). Individual per-request latency to this archive can be surprisingly
+high (~15-20s observed on one run, vs. sub-second on earlier small manual
+tests) — not a bug in this script, just the live archive's actual response
+time varying; threading absorbs that by overlapping requests rather than
+paying the full latency serially.
 
 Once downloaded: in the Kaggle UI, **New Dataset → upload the output directory →
 version it** as `halpha-raw`. This is the only stage that needs internet
@@ -143,7 +161,8 @@ downloaded corpus:
 
 ```bash
 python scripts/pretrain_data/preprocess_gong.py \
-    --raw-dir data/raw/gong_pretrain --out-dir data/processed/gong_pretrain
+    --raw-dir data/raw/gong_pretrain --out-dir data/processed/gong_pretrain \
+    --processes 8 --log-file data/processed/gong_pretrain/preprocess.log
 ```
 
 One pass, per frame: read the FITS data → linearly rescale *that image's own*
@@ -152,6 +171,13 @@ min/max to `[0, 255]` (the only unavoidable step to fit 16-bit data into an
 JPEG (quality 95) → record `(cx, cy, r)` in `manifest.csv` as metadata. Ran
 against 20 real downloaded frames (both sites) — all 20 converted, off-disk
 background reads exactly 0, filament threads and plage visible, no artifacts.
+
+**Multi-process, not multi-threaded**, unlike Stage 1: this is CPU-bound work
+(FITS decompression, array rescaling, JPEG encoding), so a `ProcessPoolExecutor`
+(`--processes`, default = CPU count) actually uses multiple cores, where
+threads wouldn't (the GIL). Each worker returns only the lightweight manifest
+row, not the pixel array, back to the main process. `--log-file` gives the
+same running progress line as Stage 1.
 
 Save output as Kaggle Dataset `halpha-preprocessed` — every future pretraining
 session mounts this read-only, no re-downloading or re-processing.

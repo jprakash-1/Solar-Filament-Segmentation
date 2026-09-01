@@ -8,6 +8,12 @@ filtering strictly to `.fits.fz` hrefs. The listing page also contains a
 zero-font-size decoy link (a bot-trap) that must never be followed; the
 `.fits.fz` suffix filter already excludes it, but don't loosen that filter.
 
+Both `manifest` and `download` are multi-threaded (I/O-bound: network
+requests, not CPU work) via a bounded ThreadPoolExecutor -- each thread gets
+its own `requests.Session` (thread-local) rather than sharing one across
+threads. `--workers` controls concurrency; keep it modest (default 4) since
+this is hitting a shared public archive, not a CDN built for parallel clients.
+
 Two-step usage, matching the "manifest before download" plan:
     python scripts/pretrain_data/gong_halpha.py manifest --out data/raw/gong_pretrain/manifest.csv
     python scripts/pretrain_data/gong_halpha.py download --manifest data/raw/gong_pretrain/manifest.csv \
@@ -18,7 +24,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -42,11 +51,29 @@ SITE_CODES = {
 
 USER_AGENT = "solar-filament-segmentation-2026-pretrain-data (research, low-rate)"
 REQUEST_TIMEOUT = 30
-REQUEST_DELAY_SECONDS = 0.5  # politeness delay between requests to a public archive
+REQUEST_DELAY_SECONDS = 0.5  # politeness delay a single thread waits between its
+# own requests -- with N worker threads the aggregate rate is roughly N/0.5 req/s,
+# which is why --workers defaults to a modest 4 rather than something large
 DAY_RETRIES = 2  # transient-failure retries for a single day's listing/download,
 # not a substitute for the upfront connectivity check below -- a systemic outage
 # (e.g. Kaggle's Internet toggle off) should fail fast with a clear message, not
 # retry-and-skip silently across a whole multi-year date range doing nothing useful
+
+logger = logging.getLogger("gong_halpha")
+
+
+def setup_logging(log_file: Path | None = None, level: int = logging.INFO) -> None:
+    logger.setLevel(level)
+    logger.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
 
 
 @dataclass
@@ -56,48 +83,61 @@ class FrameRef:
     url: str
 
 
+_thread_local = threading.local()
+
+
 def _session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT})
-    return s
+    """One requests.Session per worker thread (thread-local), not one shared
+    session across threads -- sidesteps any question of whether concurrent use
+    of a single Session is safe, at the cost of one extra connection pool per
+    thread (negligible at --workers ~4-8)."""
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        s.headers.update({"User-Agent": USER_AGENT})
+        _thread_local.session = s
+    return _thread_local.session
 
 
-def check_connectivity(session: requests.Session) -> None:
+def check_connectivity() -> None:
     """Fail fast with an actionable message if the archive is unreachable at
     all, instead of only discovering it after retrying every single day in a
     multi-year date range. A `ConnectTimeout` here (not a slow response, a
-    failure to even open the TCP connection) on Kaggle almost always means the
-    notebook's Internet toggle is off (Settings -> Internet -> On, requires
-    phone verification on the account) rather than a problem with this code or
-    the archive itself."""
+    failure to even open the TCP connection) on Kaggle can mean the notebook's
+    Internet toggle is off (Settings -> Internet -> On, requires phone
+    verification on the account) -- but if general internet access otherwise
+    works (e.g. `!wget google.com` succeeds), this instead points at this
+    specific host being unreachable from that network (e.g. an IP-range block
+    on the archive's side), not a local settings problem."""
     try:
-        session.get(BASE_URL, timeout=REQUEST_TIMEOUT)
+        _session().get(BASE_URL, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as e:
         raise RuntimeError(
-            f"Could not reach {BASE_URL} ({e}). On Kaggle, this almost always "
-            "means the notebook's Internet access is off -- enable it under "
-            "Settings -> Internet (requires phone verification on the "
-            "account), then rerun this cell. If Internet is already on, this "
-            "may be a transient network issue -- wait a moment and retry."
+            f"Could not reach {BASE_URL} ({e}). If general internet access "
+            "works otherwise (e.g. Kaggle's Internet toggle is on and "
+            "google.com is reachable), this points at this specific host "
+            "being blocked/unreachable from this network -- try downloading "
+            "elsewhere and uploading the result as a Kaggle Dataset instead. "
+            "If general internet access doesn't work either, enable it under "
+            "Settings -> Internet first."
         ) from e
 
 
-def _get_with_retry(session: requests.Session, url: str, retries: int = DAY_RETRIES) -> requests.Response | None:
+def _get_with_retry(url: str, retries: int = DAY_RETRIES) -> requests.Response | None:
     """Retry a transient connection failure a couple of times before giving up
     on just this one URL (the whole run already passed check_connectivity, so
     this is about a single flaky request, not a systemic outage)."""
     for attempt in range(retries + 1):
         try:
-            return session.get(url, timeout=REQUEST_TIMEOUT)
+            return _session().get(url, timeout=REQUEST_TIMEOUT)
         except (requests.ConnectionError, requests.Timeout) as e:
             if attempt == retries:
-                print(f"warning: giving up on {url} after {retries + 1} attempts ({e})")
+                logger.warning(f"giving up on {url} after {retries + 1} attempts ({e})")
                 return None
             time.sleep(2 * (attempt + 1))
     return None
 
 
-def list_day_files(session: requests.Session, site_letter: str, day: date) -> list[FrameRef]:
+def list_day_files(site_letter: str, day: date) -> list[FrameRef]:
     """List one site's files for one UTC day. Returns [] if the day has no
     directory (e.g. too far in the future), the site has no frames that day
     (down for maintenance, weather, etc.), or the request failed even after
@@ -106,7 +146,8 @@ def list_day_files(session: requests.Session, site_letter: str, day: date) -> li
     yyyymm = day.strftime("%Y%m")
     yyyymmdd = day.strftime("%Y%m%d")
     url = f"{BASE_URL}/{yyyymm}/{yyyymmdd}/"
-    resp = _get_with_retry(session, url)
+    resp = _get_with_retry(url)
+    time.sleep(REQUEST_DELAY_SECONDS)
     if resp is None:
         return []
     if resp.status_code == 404:
@@ -150,29 +191,73 @@ def nearest_per_hour(frames: list[FrameRef], tolerance_minutes: int = 20) -> lis
     return sorted(by_hour.values(), key=lambda f: f.timestamp)
 
 
+def _enumerate_tasks(sites: list[str], date_ranges: list[tuple[date, date]], day_stride: int) -> list[tuple[str, date]]:
+    tasks = []
+    for start, end in date_ranges:
+        day = start
+        while day <= end:
+            for site in sites:
+                tasks.append((SITE_CODES[site], day))
+            day += timedelta(days=day_stride)
+    return tasks
+
+
 def build_manifest(
     sites: list[str],
     date_ranges: list[tuple[date, date]],
     day_stride: int = 1,
     tolerance_minutes: int = 20,
     max_images: int | None = None,
+    checkpoint_path: Path | None = None,
+    progress_every: int = 20,
+    workers: int = 4,
 ) -> list[FrameRef]:
     """Walk the given date ranges (stepping every `day_stride` days) and
-    collect ~1 frame/hour per site. Ground telescopes only see the Sun during
-    local daytime, so expect well under 24 frames/site/day, not a full day's
-    worth -- that's normal, not a bug."""
-    session = _session()
-    check_connectivity(session)
+    collect ~1 frame/hour per site, `workers` (site, day) listings at a time.
+    Ground telescopes only see the Sun during local daytime, so expect well
+    under 24 frames/site/day, not a full day's worth -- that's normal, not a
+    bug.
+
+    Logs a running "N/total" progress line every `progress_every` completed
+    listings (wall-clock alone isn't a reliable progress signal -- any single
+    request can silently retry/backoff). If `checkpoint_path` is given, the
+    manifest built *so far* (pre-subsampling) is written there at the same
+    cadence, so a killed run still leaves a real, inspectable partial CSV."""
+    check_connectivity()
+    tasks = _enumerate_tasks(sites, date_ranges, day_stride)
+    total = len(tasks)
+    logger.info(f"listing {total} (site, day) combinations using {workers} threads")
+
     manifest: list[FrameRef] = []
-    for start, end in date_ranges:
-        day = start
-        while day <= end:
-            for site in sites:
-                site_letter = SITE_CODES[site]
-                frames = list_day_files(session, site_letter, day)
-                manifest.extend(nearest_per_hour(frames, tolerance_minutes))
-                time.sleep(REQUEST_DELAY_SECONDS)
-            day += timedelta(days=day_stride)
+    lock = threading.Lock()
+    completed = 0
+    start_time = time.monotonic()
+
+    def _worker(site_letter: str, day: date) -> list[FrameRef]:
+        return nearest_per_hour(list_day_files(site_letter, day), tolerance_minutes)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_worker, site_letter, day): (site_letter, day) for site_letter, day in tasks}
+        for future in as_completed(futures):
+            site_letter, day = futures[future]
+            try:
+                frames = future.result()
+            except Exception as e:
+                logger.warning(f"failed listing site={site_letter} day={day}: {e}")
+                frames = []
+            with lock:
+                manifest.extend(frames)
+                completed += 1
+                if completed % progress_every == 0 or completed == total:
+                    elapsed = time.monotonic() - start_time
+                    rate = elapsed / completed
+                    remaining = rate * (total - completed)
+                    logger.info(
+                        f"[{completed}/{total}] {len(manifest)} frames so far -- "
+                        f"elapsed {elapsed / 60:.1f}min, ~{remaining / 60:.1f}min remaining"
+                    )
+                    if checkpoint_path:
+                        write_manifest_csv(sorted(manifest, key=lambda f: (f.site, f.timestamp)), checkpoint_path)
 
     manifest.sort(key=lambda f: (f.site, f.timestamp))
     if max_images and len(manifest) > max_images:
@@ -192,30 +277,56 @@ def write_manifest_csv(manifest: list[FrameRef], out_csv: Path) -> None:
             writer.writerow([frame.site, frame.timestamp.isoformat(), frame.url])
 
 
-def download_manifest(manifest_csv: Path, out_dir: Path) -> None:
-    session = _session()
-    check_connectivity(session)
+def _download_one(row: dict, out_dir: Path) -> str:
+    """Returns one of 'downloaded', 'skipped' (already on disk), 'failed'."""
+    url = row["url"]
+    dest = out_dir / row["site"] / Path(url).name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 0:
+        return "skipped"
+    resp = _get_with_retry(url)
+    if resp is None:
+        return "failed"
+    try:
+        resp.raise_for_status()
+        dest.write_bytes(resp.content)
+        return "downloaded"
+    except requests.RequestException as e:
+        logger.warning(f"skip {url}: {e}")
+        return "failed"
+
+
+def download_manifest(manifest_csv: Path, out_dir: Path, workers: int = 4, progress_every: int = 50) -> None:
+    check_connectivity()
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(manifest_csv) as f:
         rows = list(csv.DictReader(f))
+    total = len(rows)
+    logger.info(f"downloading {total} files using {workers} threads")
 
-    for i, row in enumerate(rows):
-        url = row["url"]
-        dest = out_dir / row["site"] / Path(url).name
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.exists() and dest.stat().st_size > 0:
-            continue  # resume-safe: skip already-downloaded files
-        resp = _get_with_retry(session, url)
-        try:
-            if resp is None:
-                continue  # already logged by _get_with_retry; resume-safe, rerun later
-            resp.raise_for_status()
-            dest.write_bytes(resp.content)
-        except requests.RequestException as e:
-            print(f"skip {url}: {e}")
-        time.sleep(REQUEST_DELAY_SECONDS)
-        if (i + 1) % 100 == 0:
-            print(f"downloaded {i + 1}/{len(rows)}")
+    counts = {"downloaded": 0, "skipped": 0, "failed": 0}
+    lock = threading.Lock()
+    completed = 0
+    start_time = time.monotonic()
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_download_one, row, out_dir): row for row in rows}
+        for future in as_completed(futures):
+            result = future.result()
+            with lock:
+                counts[result] += 1
+                completed += 1
+                if completed % progress_every == 0 or completed == total:
+                    elapsed = time.monotonic() - start_time
+                    rate = elapsed / completed
+                    remaining = rate * (total - completed)
+                    logger.info(
+                        f"[{completed}/{total}] downloaded={counts['downloaded']} "
+                        f"skipped={counts['skipped']} failed={counts['failed']} -- "
+                        f"elapsed {elapsed / 60:.1f}min, ~{remaining / 60:.1f}min remaining"
+                    )
+
+    logger.info(f"done: {counts}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -230,16 +341,21 @@ def parse_args() -> argparse.Namespace:
     m.add_argument("--tolerance-minutes", type=int, default=20)
     m.add_argument("--max-images", type=int, default=10000)
     m.add_argument("--out", type=Path, default=Path("data/raw/gong_pretrain/manifest.csv"))
+    m.add_argument("--workers", type=int, default=4, help="concurrent listing requests")
+    m.add_argument("--log-file", type=Path, default=None)
 
     d = sub.add_parser("download", help="download every file listed in a manifest CSV")
     d.add_argument("--manifest", type=Path, required=True)
     d.add_argument("--out-dir", type=Path, default=Path("data/raw/gong_pretrain"))
+    d.add_argument("--workers", type=int, default=4, help="concurrent downloads")
+    d.add_argument("--log-file", type=Path, default=None)
 
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    setup_logging(args.log_file)
     if args.cmd == "manifest":
         date_ranges = []
         for r in args.date_ranges:
@@ -251,11 +367,13 @@ def main() -> None:
             day_stride=args.day_stride,
             tolerance_minutes=args.tolerance_minutes,
             max_images=args.max_images,
+            checkpoint_path=args.out,
+            workers=args.workers,
         )
         write_manifest_csv(manifest, args.out)
-        print(f"wrote {len(manifest)} rows to {args.out}")
+        logger.info(f"wrote {len(manifest)} rows to {args.out}")
     elif args.cmd == "download":
-        download_manifest(args.manifest, args.out_dir)
+        download_manifest(args.manifest, args.out_dir, workers=args.workers)
 
 
 if __name__ == "__main__":
