@@ -43,6 +43,10 @@ SITE_CODES = {
 USER_AGENT = "solar-filament-segmentation-2026-pretrain-data (research, low-rate)"
 REQUEST_TIMEOUT = 30
 REQUEST_DELAY_SECONDS = 0.5  # politeness delay between requests to a public archive
+DAY_RETRIES = 2  # transient-failure retries for a single day's listing/download,
+# not a substitute for the upfront connectivity check below -- a systemic outage
+# (e.g. Kaggle's Internet toggle off) should fail fast with a clear message, not
+# retry-and-skip silently across a whole multi-year date range doing nothing useful
 
 
 @dataclass
@@ -58,14 +62,53 @@ def _session() -> requests.Session:
     return s
 
 
+def check_connectivity(session: requests.Session) -> None:
+    """Fail fast with an actionable message if the archive is unreachable at
+    all, instead of only discovering it after retrying every single day in a
+    multi-year date range. A `ConnectTimeout` here (not a slow response, a
+    failure to even open the TCP connection) on Kaggle almost always means the
+    notebook's Internet toggle is off (Settings -> Internet -> On, requires
+    phone verification on the account) rather than a problem with this code or
+    the archive itself."""
+    try:
+        session.get(BASE_URL, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as e:
+        raise RuntimeError(
+            f"Could not reach {BASE_URL} ({e}). On Kaggle, this almost always "
+            "means the notebook's Internet access is off -- enable it under "
+            "Settings -> Internet (requires phone verification on the "
+            "account), then rerun this cell. If Internet is already on, this "
+            "may be a transient network issue -- wait a moment and retry."
+        ) from e
+
+
+def _get_with_retry(session: requests.Session, url: str, retries: int = DAY_RETRIES) -> requests.Response | None:
+    """Retry a transient connection failure a couple of times before giving up
+    on just this one URL (the whole run already passed check_connectivity, so
+    this is about a single flaky request, not a systemic outage)."""
+    for attempt in range(retries + 1):
+        try:
+            return session.get(url, timeout=REQUEST_TIMEOUT)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt == retries:
+                print(f"warning: giving up on {url} after {retries + 1} attempts ({e})")
+                return None
+            time.sleep(2 * (attempt + 1))
+    return None
+
+
 def list_day_files(session: requests.Session, site_letter: str, day: date) -> list[FrameRef]:
     """List one site's files for one UTC day. Returns [] if the day has no
-    directory (e.g. too far in the future) or the site has no frames that day
-    (down for maintenance, weather, etc.) -- both are normal, not errors."""
+    directory (e.g. too far in the future), the site has no frames that day
+    (down for maintenance, weather, etc.), or the request failed even after
+    retries -- all three are non-fatal so one bad day doesn't abort the whole
+    date range."""
     yyyymm = day.strftime("%Y%m")
     yyyymmdd = day.strftime("%Y%m%d")
     url = f"{BASE_URL}/{yyyymm}/{yyyymmdd}/"
-    resp = session.get(url, timeout=REQUEST_TIMEOUT)
+    resp = _get_with_retry(session, url)
+    if resp is None:
+        return []
     if resp.status_code == 404:
         return []
     resp.raise_for_status()
@@ -119,6 +162,7 @@ def build_manifest(
     local daytime, so expect well under 24 frames/site/day, not a full day's
     worth -- that's normal, not a bug."""
     session = _session()
+    check_connectivity(session)
     manifest: list[FrameRef] = []
     for start, end in date_ranges:
         day = start
@@ -150,6 +194,7 @@ def write_manifest_csv(manifest: list[FrameRef], out_csv: Path) -> None:
 
 def download_manifest(manifest_csv: Path, out_dir: Path) -> None:
     session = _session()
+    check_connectivity(session)
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(manifest_csv) as f:
         rows = list(csv.DictReader(f))
@@ -160,8 +205,10 @@ def download_manifest(manifest_csv: Path, out_dir: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists() and dest.stat().st_size > 0:
             continue  # resume-safe: skip already-downloaded files
+        resp = _get_with_retry(session, url)
         try:
-            resp = session.get(url, timeout=REQUEST_TIMEOUT)
+            if resp is None:
+                continue  # already logged by _get_with_retry; resume-safe, rerun later
             resp.raise_for_status()
             dest.write_bytes(resp.content)
         except requests.RequestException as e:
