@@ -152,7 +152,15 @@ def list_day_files(site_letter: str, day: date) -> list[FrameRef]:
         return []
     if resp.status_code == 404:
         return []
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        # a non-2xx/404 status (500, 503, etc.) is treated the same as "no
+        # data this day" rather than propagating -- an uncaught exception
+        # here would reach build_manifest's future.result() and silently
+        # break its counting/progress-logging for every remaining future
+        logger.warning(f"skipping {url}: {e}")
+        return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
     frames = []
@@ -278,21 +286,28 @@ def write_manifest_csv(manifest: list[FrameRef], out_csv: Path) -> None:
 
 
 def _download_one(row: dict, out_dir: Path) -> str:
-    """Returns one of 'downloaded', 'skipped' (already on disk), 'failed'."""
+    """Returns one of 'downloaded', 'skipped' (already on disk), 'failed'.
+    Never raises -- any exception here (network, filesystem, whatever) would
+    otherwise propagate through future.result() in download_manifest's loop
+    and silently break its counting/progress-logging for every remaining
+    future (the ThreadPoolExecutor keeps running already-submitted downloads
+    in the background regardless, so files kept landing on disk with zero
+    further log output -- exactly what happened on a real run before this
+    except clause was widened from requests.RequestException to Exception)."""
     url = row["url"]
     dest = out_dir / row["site"] / Path(url).name
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists() and dest.stat().st_size > 0:
-        return "skipped"
-    resp = _get_with_retry(url)
-    if resp is None:
-        return "failed"
     try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() and dest.stat().st_size > 0:
+            return "skipped"
+        resp = _get_with_retry(url)
+        if resp is None:
+            return "failed"
         resp.raise_for_status()
         dest.write_bytes(resp.content)
         return "downloaded"
-    except requests.RequestException as e:
-        logger.warning(f"skip {url}: {e}")
+    except Exception as e:
+        logger.warning(f"skip {url}: {type(e).__name__}: {e}")
         return "failed"
 
 
@@ -312,7 +327,14 @@ def download_manifest(manifest_csv: Path, out_dir: Path, workers: int = 4, progr
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_download_one, row, out_dir): row for row in rows}
         for future in as_completed(futures):
-            result = future.result()
+            try:
+                result = future.result()
+            except Exception:
+                # _download_one shouldn't raise (it catches Exception itself),
+                # but this loop's counting/logging must never silently break
+                # again if something unexpected still slips through
+                logger.exception(f"unexpected error downloading {futures[future].get('url')}")
+                result = "failed"
             with lock:
                 counts[result] += 1
                 completed += 1
