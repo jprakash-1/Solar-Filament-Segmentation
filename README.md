@@ -6,4 +6,4 @@ full-disk imagery.
 
 This branch (`jp-pretraining-data-prep`) is boilerplate — MVP1's pipeline
 (`src/`, `configs/`, training notebooks) lives on `jp-mvp1` and is intentionally
-not carried over here. See `PRETRAIN_DATA_PLAN.md` for what this branch is for.
+not carried over here. See `PRETRAIN_PLAN.md` for what this branch is for.
