@@ -101,12 +101,19 @@ def limb_darkening_correct(img: np.ndarray, cx: float, cy: float, r: float, prof
     """Radial intensity normalization using an empirical profile (see
     compute_radial_profile). Off-disk background (rho >= 1) is left untouched
     -- the profile is only defined inside the solar disk, and applying a
-    correction off-disk would amplify background noise instead of leaving it flat."""
+    correction off-disk would amplify background noise instead of leaving it flat.
+
+    Interpolates the profile between bin centers (np.interp) rather than doing
+    a nearest-bin lookup -- a nearest-bin version was tried first and produced
+    visible concentric ring artifacts on real frames (confirmed by comparing
+    against the uncorrected raw image, which has no rings) from the hard
+    correction-factor jump at each bin boundary. Interpolation removes them."""
     n_bins = len(profile)
     rho = _rho_grid(img.shape, cx, cy, r)
     on_disk = rho < 1.0
-    bin_idx = np.clip((rho * n_bins).astype(int), 0, n_bins - 1)
-    correction = profile[0] / profile[bin_idx]
+    bin_centers = (np.arange(n_bins) + 0.5) / n_bins
+    interpolated = np.interp(rho, bin_centers, profile)
+    correction = profile[0] / interpolated
     out = img.copy()
     out[on_disk] = img[on_disk] * correction[on_disk]
     return out
