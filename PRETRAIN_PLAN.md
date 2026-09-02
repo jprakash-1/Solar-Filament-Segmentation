@@ -107,6 +107,20 @@ Once downloaded: in the Kaggle UI, **New Dataset → upload the output directory
 version it** as `halpha-raw`. This is the only stage that needs internet
 access — every later stage mounts a Kaggle Dataset instead.
 
+**At larger scale (6 sites, ~16 years), keeping the full raw corpus on disk
+stops being practical** — raw FITS would be ~100GB+ vs. ~20GB of JPEG output.
+`scripts/pretrain_data/download_and_convert.py` combines Stage 1+2 into one
+per-file pipeline instead: download → convert to JPEG immediately → delete the
+raw file, so raw data never accumulates beyond whatever's actively in flight.
+It reuses `gong_halpha`'s download logic and `preprocess_gong`'s conversion
+logic rather than duplicating either. The separate `download` + `preprocess`
+stages above still work standalone (already used for the first 3,033-image
+corpus); this combined script is for downloading additional data at a scale
+where the two-phase approach would need too much scratch disk. Resume-safe
+(skips a row if its JPEG already exists) and incremental (merges with
+whatever's already in `--out-dir`, so it can be run again as the source
+manifest grows without losing earlier results).
+
 ---
 
 ## 3. Stage 2 — Preprocessing
