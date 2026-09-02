@@ -28,11 +28,18 @@ with whatever's already in --out-dir (by path), so running this
 incrementally over successive manifest expansions accumulates rather than
 overwrites.
 
+A live tqdm progress bar renders on the terminal (postfix shows running
+converted/skipped/failed counts); log lines (including download/convert
+failures) print through tqdm.write() so they don't corrupt the bar.
+--log-file additionally gets the periodic summary line, undisturbed by tqdm.
+
 Usage:
     python scripts/pretrain_data/download_and_convert.py \
-        --manifest data/raw/gong_pretrain/manifest.csv \
+        --manifest manifests/gong_pretrain_manifest.csv \
         --raw-tmp-dir data/raw/gong_pretrain \
-        --out-dir data/processed/gong_pretrain
+        --out-dir data/processed/gong_pretrain \
+        --workers 8 --processes 8 \
+        --log-file data/processed/gong_pretrain/download_convert.log
 """
 
 from __future__ import annotations
@@ -47,6 +54,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from pathlib import Path
 
 from PIL import Image
+from tqdm import tqdm
 
 from gong_halpha import _get_with_retry, check_connectivity
 from preprocess_gong import _init_worker, process_one
@@ -54,11 +62,25 @@ from preprocess_gong import _init_worker, process_one
 logger = logging.getLogger("download_and_convert")
 
 
+class _TqdmLoggingHandler(logging.Handler):
+    """Routes log records through tqdm.write() instead of a plain stream --
+    printing straight to stdout/stderr while a tqdm bar is active corrupts the
+    bar's rendering (extra blank lines, the bar getting pushed down). This
+    handler is what makes the progress bar and warning-level log lines (e.g.
+    a download failure) coexist cleanly in an interactive terminal."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            tqdm.write(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
 def setup_logging(log_file: Path | None = None, level: int = logging.INFO) -> None:
     logger.setLevel(level)
     logger.handlers.clear()
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-    console = logging.StreamHandler()
+    console = _TqdmLoggingHandler()
     console.setFormatter(fmt)
     logger.addHandler(console)
     if log_file:
@@ -151,27 +173,30 @@ def download_and_convert(
                 thread_pool.submit(_download_convert_one, row, raw_tmp_dir, out_dir, process_pool): row
                 for row in rows
             }
-            for future in as_completed(futures):
-                try:
-                    status, new_row = future.result()
-                except Exception:
-                    logger.exception(f"unexpected error on {futures[future].get('url')}")
-                    status, new_row = "download_failed", None
-                with lock:
-                    counts[status] += 1
-                    if new_row:
-                        new_rows.append(new_row)
-                    completed += 1
-                    if completed % progress_every == 0 or completed == total:
-                        elapsed = time.monotonic() - start_time
-                        rate = elapsed / completed
-                        remaining = rate * (total - completed)
-                        logger.info(
-                            f"[{completed}/{total}] converted={counts['converted']} "
-                            f"skipped={counts['skipped']} download_failed={counts['download_failed']} "
-                            f"convert_failed={counts['convert_failed']} -- "
-                            f"elapsed {elapsed / 60:.1f}min, ~{remaining / 60:.1f}min remaining"
-                        )
+            with tqdm(total=total, desc="download+convert", unit="file") as pbar:
+                for future in as_completed(futures):
+                    try:
+                        status, new_row = future.result()
+                    except Exception:
+                        logger.exception(f"unexpected error on {futures[future].get('url')}")
+                        status, new_row = "download_failed", None
+                    with lock:
+                        counts[status] += 1
+                        if new_row:
+                            new_rows.append(new_row)
+                        completed += 1
+                        pbar.update(1)
+                        pbar.set_postfix(counts, refresh=False)
+                        if completed % progress_every == 0 or completed == total:
+                            elapsed = time.monotonic() - start_time
+                            rate = elapsed / completed
+                            remaining = rate * (total - completed)
+                            logger.info(
+                                f"[{completed}/{total}] converted={counts['converted']} "
+                                f"skipped={counts['skipped']} download_failed={counts['download_failed']} "
+                                f"convert_failed={counts['convert_failed']} -- "
+                                f"elapsed {elapsed / 60:.1f}min, ~{remaining / 60:.1f}min remaining"
+                            )
 
     # Merge with whatever's already in out_dir/manifest.csv rather than
     # overwriting -- lets this be run incrementally over successive manifest
