@@ -306,7 +306,18 @@ def build_manifest(
                         f"elapsed {elapsed / 60:.1f}min, ~{remaining / 60:.1f}min remaining"
                     )
                     if checkpoint_path:
-                        write_manifest_csv(sorted(manifest, key=lambda f: (f.site, f.timestamp)), checkpoint_path)
+                        # de-dupe before every checkpoint write, not just the
+                        # final return -- without this, repeated kill/resume
+                        # cycles (seeding from the last checkpoint, then
+                        # appending newly-found frames) accumulate duplicate
+                        # rows in the checkpoint itself. Hit this for real:
+                        # one paused multi-hour pull had 25,156 duplicate rows
+                        # out of 62,298 (~40%) after several kill/resume cycles,
+                        # since the checkpoint was never deduped, only the
+                        # (never-reached, this run kept getting interrupted)
+                        # final return value was.
+                        deduped = list({f.url: f for f in manifest}.values())
+                        write_manifest_csv(sorted(deduped, key=lambda f: (f.site, f.timestamp)), checkpoint_path)
 
     if progress_log:
         progress_log.close()
