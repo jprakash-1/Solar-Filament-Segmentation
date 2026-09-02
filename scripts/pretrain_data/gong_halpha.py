@@ -230,22 +230,59 @@ def build_manifest(
     listings (wall-clock alone isn't a reliable progress signal -- any single
     request can silently retry/backoff). If `checkpoint_path` is given, the
     manifest built *so far* (pre-subsampling) is written there at the same
-    cadence, so a killed run still leaves a real, inspectable partial CSV."""
+    cadence, so a killed run leaves a real, inspectable partial CSV.
+
+    Genuinely resumable, not just checkpointed for visibility: a sidecar
+    `<checkpoint_path>.progress` file records one "site,day" line per
+    *completed* (site, day) task, flushed immediately after each one (not
+    just at the progress_every cadence). On start, any already-completed
+    tasks found there are skipped entirely, and the matching checkpoint
+    manifest CSV (if present) is loaded to seed the running result -- a large
+    multi-hour pull that gets killed partway (e.g. a ~11K-task, ~6-site,
+    15-year pull was killed by the environment after ~63 minutes / ~26% done
+    in practice) picks up where it left off instead of re-querying everything
+    from scratch."""
     check_connectivity()
     tasks = _enumerate_tasks(sites, date_ranges, day_stride)
     total = len(tasks)
-    logger.info(f"listing {total} (site, day) combinations using {workers} threads")
 
+    progress_log_path = Path(str(checkpoint_path) + ".progress") if checkpoint_path else None
     manifest: list[FrameRef] = []
+    done_tasks: set[tuple[str, date]] = set()
+    # Seed from an existing checkpoint CSV whenever one is present -- even
+    # without a matching .progress file (e.g. a checkpoint left by a run from
+    # before this resumability was added), those frames are still real and
+    # shouldn't be thrown away. The URL-based de-dupe at the end of this
+    # function makes it safe to seed frames without also knowing exactly
+    # which tasks produced them.
+    if checkpoint_path and checkpoint_path.exists():
+        with open(checkpoint_path) as f:
+            for row in csv.DictReader(f):
+                manifest.append(FrameRef(row["site"], datetime.fromisoformat(row["timestamp"]), row["url"]))
+    if progress_log_path and progress_log_path.exists():
+        with open(progress_log_path) as f:
+            for line in f:
+                site_letter, day_iso = line.strip().split(",")
+                done_tasks.add((site_letter, date.fromisoformat(day_iso)))
+    if manifest or done_tasks:
+        logger.info(f"resuming: {len(done_tasks)} tasks marked done, {len(manifest)} frames already collected")
+
+    remaining_tasks = [t for t in tasks if t not in done_tasks]
+    logger.info(
+        f"listing {len(remaining_tasks)}/{total} remaining (site, day) combinations "
+        f"using {workers} threads"
+    )
+
     lock = threading.Lock()
-    completed = 0
+    completed = len(done_tasks)
     start_time = time.monotonic()
+    progress_log = open(progress_log_path, "a") if progress_log_path else None
 
     def _worker(site_letter: str, day: date) -> list[FrameRef]:
         return nearest_per_hour(list_day_files(site_letter, day), tolerance_minutes)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_worker, site_letter, day): (site_letter, day) for site_letter, day in tasks}
+        futures = {executor.submit(_worker, site_letter, day): (site_letter, day) for site_letter, day in remaining_tasks}
         for future in as_completed(futures):
             site_letter, day = futures[future]
             try:
@@ -256,9 +293,13 @@ def build_manifest(
             with lock:
                 manifest.extend(frames)
                 completed += 1
+                if progress_log:
+                    progress_log.write(f"{site_letter},{day.isoformat()}\n")
+                    progress_log.flush()
                 if completed % progress_every == 0 or completed == total:
                     elapsed = time.monotonic() - start_time
-                    rate = elapsed / completed
+                    done_this_run = completed - len(done_tasks)
+                    rate = elapsed / max(done_this_run, 1)
                     remaining = rate * (total - completed)
                     logger.info(
                         f"[{completed}/{total}] {len(manifest)} frames so far -- "
@@ -267,6 +308,13 @@ def build_manifest(
                     if checkpoint_path:
                         write_manifest_csv(sorted(manifest, key=lambda f: (f.site, f.timestamp)), checkpoint_path)
 
+    if progress_log:
+        progress_log.close()
+
+    # De-dupe by URL -- a resumed run without a matching .progress file for an
+    # older, pre-resumability checkpoint can re-query some already-covered
+    # (site, day) tasks, which would otherwise double-count those frames
+    manifest = list({f.url: f for f in manifest}.values())
     manifest.sort(key=lambda f: (f.site, f.timestamp))
     if max_images and len(manifest) > max_images:
         # even subsample across the whole manifest rather than truncating,
