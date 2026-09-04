@@ -75,9 +75,12 @@ def nearest_neighbors(
 
 def _save_neighbor_grid(images: torch.Tensor, topk: torch.Tensor, out_path: str, n_rows: int = 8) -> None:
     """Saves a PNG grid: row i = query image i followed by its k nearest neighbors."""
+    from pathlib import Path
+
     import numpy as np
     from PIL import Image
 
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     n_rows = min(n_rows, images.shape[0])
     k = topk.shape[1]
     crop = images.shape[-1]

@@ -225,6 +225,11 @@ def main() -> None:
 
         avg_loss = epoch_loss / max(1, n_batches)
         if is_main:
+            # Checkpoint the trained epoch before the health checks below -- a bug or
+            # transient failure in validation/visualization must not cost the epoch's
+            # GPU time (Kaggle sessions are capped and re-training isn't free).
+            save_checkpoint(args.checkpoint_out, model_module, optimizer, scaler, epoch, args)
+
             val_loss, emb_std = float("nan"), float("nan")
             do_health_check = val_loader is not None and (epoch % args.health_check_every == 0 or epoch == args.epochs - 1)
             if do_health_check:
@@ -242,8 +247,6 @@ def main() -> None:
                 if write_header:
                     writer.writerow(["epoch", "train_loss", "val_loss", "embedding_std", "tau", "lr"])
                 writer.writerow([epoch, avg_loss, val_loss, emb_std, tau, lr])
-
-            save_checkpoint(args.checkpoint_out, model_module, optimizer, scaler, epoch, args)
 
             if time.time() - session_start > args.session_budget_seconds:
                 if stop_early is not None:
