@@ -70,13 +70,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None, help="cuda / mps / cpu -- auto-detected if omitted (ignored under torchrun, which sets the GPU per rank)")
     p.add_argument("--num-workers", type=int, default=0, help="DataLoader worker processes; keep 0 for local CPU/MPS debugging, raise (e.g. 4) on GPU to stop data loading from bottlenecking GPU utilization")
-    p.add_argument("--checkpoint-out", type=Path, default=Path("outputs/checkpoints/resnet50_byol.pt"))
+    p.add_argument("--checkpoint-out", type=Path, default=Path("outputs/checkpoints/resnet50_byol.pt"), help="'latest' checkpoint, overwritten every epoch -- this is what --resume should point at")
+    p.add_argument("--best-checkpoint-out", type=Path, default=None,
+                    help="checkpoint written only when val_loss improves; defaults to 'best.pt' next to --checkpoint-out")
     p.add_argument("--resume", type=Path, default=None, help="checkpoint to resume from, e.g. the mounted halpha-byol-ckpt dataset's latest.pt")
     p.add_argument("--log-csv", type=Path, default=Path("outputs/logs/byol_train_log.csv"))
     p.add_argument("--session-budget-seconds", type=float, default=8 * 3600, help="self-stop with margin before Kaggle's session cap")
     p.add_argument("--health-check-every", type=int, default=5, help="epochs between held-out val loss + embedding-std + nearest-neighbor checks")
     p.add_argument("--nn-grid-out", type=Path, default=Path("outputs/logs/byol_nn_grid.png"))
     p.add_argument("--max-images", type=int, default=None, help="debug/smoke-test cap on corpus size")
+    p.add_argument("--early-stop-patience", type=int, default=None,
+                    help="stop once val_loss has failed to improve by --early-stop-min-delta for this many "
+                         "consecutive health checks (not epochs -- see --health-check-every); unset disables")
+    p.add_argument("--early-stop-min-delta", type=float, default=1e-4,
+                    help="minimum val_loss decrease to count as an improvement for early stopping")
     return p.parse_args()
 
 
@@ -109,7 +116,16 @@ def tau_schedule(epoch: int, total_epochs: int, tau_base: float) -> float:
     return 1.0 - (1.0 - tau_base) * (1 + math.cos(math.pi * progress)) / 2
 
 
-def save_checkpoint(path: Path, model_module: torch.nn.Module, optimizer, scaler, epoch: int, args: argparse.Namespace) -> None:
+def save_checkpoint(
+    path: Path,
+    model_module: torch.nn.Module,
+    optimizer,
+    scaler,
+    epoch: int,
+    args: argparse.Namespace,
+    best_val_loss: float,
+    epochs_without_improvement: int,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Stringify args (argparse gives us Path objects for several fields) so the
     # checkpoint round-trips through torch.load's default weights_only=True
@@ -121,6 +137,10 @@ def save_checkpoint(path: Path, model_module: torch.nn.Module, optimizer, scaler
         "scaler": scaler.state_dict(),
         "epoch": epoch,
         "args": args_dict,
+        # Early-stopping state, so a --resume across Kaggle sessions doesn't reset the
+        # no-improvement clock and just keep going past a plateau it already found.
+        "best_val_loss": best_val_loss,
+        "epochs_without_improvement": epochs_without_improvement,
     }, path)
 
 
@@ -150,6 +170,8 @@ def main() -> None:
     device = resolve_device(local_rank, args.device)
     is_main = rank == 0
 
+    best_checkpoint_out = args.best_checkpoint_out or args.checkpoint_out.parent / "best.pt"
+
     base_lr = args.base_lr if args.base_lr is not None else 0.2 * (args.batch_size * world_size) / 256
     if is_main:
         logger.info(f"world_size={world_size} device={device} per_gpu_batch={args.batch_size} base_lr={base_lr:.4f}")
@@ -168,12 +190,16 @@ def main() -> None:
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     start_epoch = 0
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
     if args.resume and args.resume.exists():
         ckpt = torch.load(args.resume, map_location=device)
         model_module.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt["epoch"] + 1
+        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        epochs_without_improvement = ckpt.get("epochs_without_improvement", 0)
         if is_main:
             logger.info(f"resumed from {args.resume} at epoch {start_epoch}")
 
@@ -228,7 +254,8 @@ def main() -> None:
             # Checkpoint the trained epoch before the health checks below -- a bug or
             # transient failure in validation/visualization must not cost the epoch's
             # GPU time (Kaggle sessions are capped and re-training isn't free).
-            save_checkpoint(args.checkpoint_out, model_module, optimizer, scaler, epoch, args)
+            save_checkpoint(args.checkpoint_out, model_module, optimizer, scaler, epoch, args,
+                             best_val_loss, epochs_without_improvement)
 
             val_loss, emb_std = float("nan"), float("nan")
             do_health_check = val_loader is not None and (epoch % args.health_check_every == 0 or epoch == args.epochs - 1)
@@ -236,7 +263,21 @@ def main() -> None:
                 val_loss = run_validation(model_module, val_loader, device)
                 emb_std = embedding_std(model_module.online_encoder, val_loader, device)
                 nearest_neighbors(model_module.online_encoder, val_loader, device, grid_out=str(args.nn_grid_out))
-                logger.info(f"epoch {epoch} | train_loss {avg_loss:.4f} | val_loss {val_loss:.4f} | emb_std {emb_std:.4f} | tau {tau:.5f} | lr {lr:.2e}")
+                improved = val_loss < best_val_loss - args.early_stop_min_delta
+                if improved:
+                    best_val_loss = val_loss
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                # Re-save now that best_val_loss/epochs_without_improvement reflect this
+                # health check -- cheap since it only runs once per --health-check-every.
+                save_checkpoint(args.checkpoint_out, model_module, optimizer, scaler, epoch, args,
+                                 best_val_loss, epochs_without_improvement)
+                if improved:
+                    save_checkpoint(best_checkpoint_out, model_module, optimizer, scaler, epoch, args,
+                                     best_val_loss, epochs_without_improvement)
+                patience_str = f"{epochs_without_improvement}/{args.early_stop_patience}" if args.early_stop_patience else str(epochs_without_improvement)
+                logger.info(f"epoch {epoch} | train_loss {avg_loss:.4f} | val_loss {val_loss:.4f} | emb_std {emb_std:.4f} | tau {tau:.5f} | lr {lr:.2e} | no_improve {patience_str}")
             else:
                 logger.info(f"epoch {epoch} | train_loss {avg_loss:.4f} | tau {tau:.5f} | lr {lr:.2e}")
 
@@ -248,18 +289,21 @@ def main() -> None:
                     writer.writerow(["epoch", "train_loss", "val_loss", "embedding_std", "tau", "lr"])
                 writer.writerow([epoch, avg_loss, val_loss, emb_std, tau, lr])
 
-            if time.time() - session_start > args.session_budget_seconds:
+            budget_hit = time.time() - session_start > args.session_budget_seconds
+            early_stop_hit = bool(args.early_stop_patience) and epochs_without_improvement >= args.early_stop_patience
+            if budget_hit or early_stop_hit:
+                stop_reason = "session budget" if budget_hit else f"early stopping (val_loss hasn't improved in {epochs_without_improvement} health checks)"
                 if stop_early is not None:
                     stop_early += 1
                 else:
-                    logger.info(f"session budget reached at epoch {epoch}, stopping cleanly")
+                    logger.info(f"{stop_reason} reached at epoch {epoch}, stopping cleanly")
                     break
 
         if distributed:
             dist.broadcast(stop_early, src=0)
             if stop_early.item() > 0:
                 if is_main:
-                    logger.info(f"session budget reached at epoch {epoch}, stopping cleanly")
+                    logger.info(f"{stop_reason} reached at epoch {epoch}, stopping cleanly")
                 break
 
     if distributed:
