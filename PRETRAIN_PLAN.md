@@ -196,6 +196,34 @@ same running progress line as Stage 1.
 Save output as Kaggle Dataset `halpha-preprocessed` — every future pretraining
 session mounts this read-only, no re-downloading or re-processing.
 
+**Post-hoc thinning (added after the 6-site/16-year corpus reached 40,174
+images, well over the original 5-10K target):** consecutive-hour frames from
+the same site turned out to be near-duplicates by construction — the Sun
+only rotates ~0.5°/hour and filaments persist for hours-to-days. Measured
+directly on the corpus (disk-cropped SSIM at native `(1024, 1024, 900)`
+geometry): same-site consecutive-hour pairs average SSIM 0.91 (85% exceed
+0.90), vs. 0.79 for random cross-date pairs and 0.84 for same-site frames
+~3 days apart (the existing `--day-stride 3`). The corpus's real diversity
+axis is across dates/sites, not within a day, so `scripts/pretrain_data/thin_manifest.py`
+keeps at most 2 frames per (site, date) — the ones nearest the 25th/75th
+percentile time, spread across the middle of the day rather than the
+possibly-noisier limb-grazing first/last frames — producing
+`manifest_thinned.csv` (8,557 rows, 21% of the full corpus, back in the
+original target range). This is structured temporal subsampling targeted at
+the known redundancy source, not generic perceptual-hash/pairwise dedup, and
+is non-destructive: it only writes a new manifest, the full 40,174-image
+corpus stays on disk untouched. Stage 3 should point `MANIFEST` at
+`manifest_thinned.csv` rather than `manifest.csv`.
+
+(Note found while building this: `data/processed/gong_pretrain/manifest.csv`
+itself only covers ~16K of the 40,174 on-disk JPEGs — some prior run(s) added
+files without updating it. `thin_manifest.py` works around this by using the
+JPEG directory listing, not the manifest, as the source of truth for which
+files exist, falling back to the standardized `(1024, 1024, 900)` geometry
+for files the manifest doesn't cover. Worth a proper fix in the Stage 1/2
+scripts' manifest-merge logic if `manifest.csv` needs to be authoritative for
+something else later.)
+
 ---
 
 ## 4. Stage 3 — MAE pretraining (DDP, 2×T4, resumable)
@@ -351,7 +379,7 @@ from dataset import HalphaMAEDataset
 from model import build_vitmae_1ch
 from distributed import setup_distributed, cleanup_distributed
 
-MANIFEST = "/kaggle/input/halpha-preprocessed/manifest.csv"
+MANIFEST = "/kaggle/input/halpha-preprocessed/manifest_thinned.csv"
 CKPT_DIR = "/kaggle/working/checkpoints"
 RESUME_CKPT = "/kaggle/input/halpha-mae-ckpt/latest.pt"  # None on the very first session
 
@@ -472,22 +500,396 @@ Launch cell:
    reconstructed or blurred away. This is the earliest quality signal, well before
    any downstream segmentation metric is available.
 
+### 4.5 Held-out split for pretraining itself (needed before trusting the loss curve)
+
+`HalphaMAEDataset`/`train_ddp.py` above train on the *entire* thinned manifest with
+no held-out split — there is currently no way to tell whether `loss_log.csv`
+reflects real generalization or Stage 3 memorizing the corpus (~8.5K rows in
+`manifest_thinned.csv` as of the post-hoc thinning in section 3, though the raw
+on-disk JPEG count has since grown past that) over up to 200 epochs. Before
+trusting "the loss plateaued" as a stopping signal in section 4.4:
+
+- Hold out ~3-5% of `manifest_thinned.csv` rows as a fixed validation set, grouped
+  by **date** (not row) so a held-out day's frames aren't near-duplicates of a
+  training day's — the same SSIM redundancy the thinning step itself was built to
+  address (section 3) would otherwise leak straight across this split too.
+- Log val MAE loss every few epochs (a rank-0-only, no-grad pass — doesn't need DDP).
+- Train loss still dropping while val loss flattens or rises is overfitting the
+  pretext task specifically. Fix: smaller model, higher mask ratio, or more corpus
+  diversity — not more epochs.
+- This risk scales with model size against a fixed corpus: ViT-Base (~86M params)
+  is more likely to overfit an 8.5-50K-image single-domain corpus than ViT-Small
+  (~22M) is. Start with **Small** regardless of the throughput-driven pick in 4.2's
+  open item, and only move to Base if val loss shows no overfitting signal at Small.
+
 ---
 
-## 5. Stage 4 — Handoff to segmentation fine-tuning (separate notebook)
+## 5. Stage 4 — Segmentation fine-tuning
 
-- Load `model.module.vit` (encoder only) from the final MAE checkpoint; discard the
-  MAE decoder.
-- Attach a segmentation decoder (UperNet-style head pulling features from multiple
-  ViT layer depths, or a simpler FPN head).
-- Fine-tune end-to-end on labeled MAGFiLO data (the `jp-mvp1` pipeline's
-  `src/dataset.py` COCO parsing / group-aware split can be reused directly) with a
-  Tversky/boundary-aware loss, using layer-wise LR decay (lower LR on the
-  pretrained encoder, higher on the fresh decoder head).
-- Ablation to run before trusting the SSL investment: MAE-pretrained encoder vs.
-  ImageNet-initialized encoder vs. scratch, same decoder/loss held fixed — this
-  quantifies whether pretraining is actually paying off before sinking further
-  compute into longer pretraining runs.
+**Scale reality check driving every choice below:** the labeled side of this
+problem is `MAGFiLO_1.0_Kaggle_2026/train` — verified directly from the COCO JSON
+(`MAGFiLO_1.0_Annotations_kaggle2026_train.json`): **707 unique underlying images**
+(1,154 annotated `image_id`s, because the same physical frame can carry multiple
+independent annotator passes — `kaggle.md`'s "1,039" figure was an earlier EDA
+pass; only 20 images are downloaded locally right now as a sample either way),
+**8,199 instance annotations**, median **7 instances/image** (up to 26), median
+instance area **1,228 px²** (p10 409 px²) against the full 2048×2048 frame, median
+bbox aspect ratio **1.66** (p90 3.2, max 12.8 — elongated, not extreme). Grouping
+for any split must be by `file_name`, never `image_id` (`jp-mvp1:src/dataset.py`'s
+`group_split` already does this). That label count is roughly **2 orders of
+magnitude smaller** than even the thinned pretraining corpus, and the instance
+geometry (small, elongated — *not* densely adjacent, see §5.1's corrected
+measurement) is what drives the head/architecture choice below, not just the
+label count.
+
+### 5.1 Segmentation model / head: what actually separates instances
+
+**This section was revised after review caught two errors in the original
+version below — kept visible rather than silently rewritten, because the
+correction is more instructive than the clean version would be.** Original
+claim: filament geometry is "small, elongated, *dense*," therefore instance
+*separation* (specifically: clustering nearby/touching instances apart) is the
+bottleneck, therefore a learned separation mechanism (embedding clustering)
+should be preferred. Two things were wrong with that:
+
+1. **"Don't crop to a box" and "cluster in embedding space" got conflated.**
+   The box-cropping complaint actually decomposes into two independent
+   failures: (a) an axis-aligned box around a thin diagonal curve is mostly
+   background, so RoIAlign hands the mask head a bad crop — a *fill-ratio*
+   problem, true regardless of how close other instances are; (b) box-IoU/NMS
+   suppression when instances are near each other — an *adjacency* problem.
+   Embedding clustering fixes both, but so does anything that predicts masks
+   over the full feature map without cropping at all (CondInst, Mask2Former,
+   Panoptic-DeepLab's center+offset scheme). The geometry argument licenses
+   "don't crop to a box," not "cluster in embedding space" specifically — those
+   are different commitments with different implementation costs, and the
+   original write-up jumped from the first to the second without ruling out
+   the middle ground.
+
+2. **"Dense" was asserted, not measured — and the measurement contradicts it.**
+   Checked directly against `MAGFiLO_1.0_Annotations_kaggle2026_train.json`:
+   for every instance in the 1,051 multi-instance images, distance from its
+   mask to the nearest *other* instance's mask. **69% of instances have no
+   other instance within 60px at all**; only **0.3% touch or overlap (gap
+   ≤2px)**, **2.7% are within 10px**, **5.5% within 20px** — median gap for
+   instances that do have a neighbor within 60px is 46.7px. That is not a
+   dense, mutually-adjacent field of objects (the EmbedSeg-style regime this
+   was implicitly modeled on — hundreds of touching nuclei — where clustering
+   resolves genuine ambiguity). It's mostly-isolated objects. A correct
+   semantic mask fed through plain connected components would already separate
+   the large majority of instances correctly, because they're mostly just not
+   touching. Whatever drives `kaggle.md`'s "crowded images under-segment"
+   finding, it is very unlikely to be geometric adjacency between distinct
+   filaments at a rate that would justify embedding clustering as the fix —
+   self-fragmentation of one winding filament (its probability map dipping
+   below threshold somewhere along its length) is a more plausible candidate,
+   and it's a *different* failure mode that clustering doesn't obviously
+   address at all.
+
+**What still holds:** filaments are thin and non-compact, so cropping to a box
+degrades the mask head. That's real and doesn't depend on the adjacency
+measurement above. **What doesn't hold:** the specific preference for embedding
+clustering over other box-free options, which was leaning on "dense" and on
+a citation (the in-domain solar filament paper using CondInst) that actually
+argues for the *opposite, cheaper* fix — CondInst keeps a box-based FCOS
+detection front end and only avoids RoIAlign for the mask itself, i.e. it
+fixes failure (a) above while keeping detection, which is evidence for "fix
+the mask head," not "add clustering."
+
+**The right evaluation frame is PQ's own decomposition, not shape adjectives.**
+PQ = SQ (segmentation quality: mean IoU over *matched* instances) × RQ
+(recognition quality: precision/recall of the Hungarian match at IoU>0.5).
+Different failure modes hit different terms, so candidates should be compared
+by which term they actually move:
+
+- **Missed detection** (a faint/low-contrast filament never predicted at all)
+  → pure RQ loss (a false negative). Given the adjacency finding, this is
+  currently the more plausible dominant error than merges.
+- **Self-fragmentation / over-segmentation** (one filament predicted as several
+  pieces) → RQ loss, double-counted (a spurious extra prediction *and* a
+  degraded match on the real instance).
+- **Merge of two distinct instances** → RQ loss (one match lost) — but per the
+  adjacency measurement, the *opportunity* for this specific error is rare
+  (≤5.5% of instances even have a neighbor within 20px), so this is unlikely to
+  be the dominant term regardless of separation mechanism.
+- **Boundary/mask-quality error on an otherwise-correct instance** → SQ loss
+  directly, and *discontinuously* becomes an RQ loss too if it drags IoU below
+  the 0.5 matching threshold.
+
+This is a hypothesis about where the error mass currently sits, not yet a
+finding — it needs `kaggle.md`'s own Month-2 Step 3 per-image error-analysis
+tooling run against the current `jp-mvp1` baseline's real predictions,
+classified by failure type (missed / fragmented / merged / poor-boundary) and
+split into SQ vs. RQ contribution.
+
+**Candidates, now framed as "which PQ term does each one actually move,"
+none preferred yet:**
+
+- **(A) Semantic mask + watershed (current baseline).** Already working;
+  postprocessing-only tuning already produced an 8x local PQ jump
+  (`kaggle.md`), proof this axis has headroom on top of this exact model
+  before any architecture change. No shape prior in the split step, so
+  self-fragmentation (the more plausible failure mode per above) isn't
+  addressed by it — but neither is it addressed by embedding clustering,
+  which targets adjacency-driven merges instead.
+- **(B) Semantic mask + pixel-embedding instance head.** Fixes the box-crop
+  fill-ratio problem (still valid) and would fix adjacency-driven merges — but
+  the adjacency measurement suggests that specific benefit applies to a small
+  minority of instances here. Adds a new loss and a new inference-time
+  clustering-bandwidth hyperparameter — real implementation cost for a
+  mechanism that may not target the dominant error.
+- **(C) Mask R-CNN + ResNet-FPN.** Median instance area (1,228px²) sits below
+  COCO's own "small object" threshold (1,024px²) at native resolution, further
+  shrunk by the standard ~800px-short-side resize; fixed 28×28 RoI mask grid
+  discards fine structure for AR-up-to-12.8 shapes. Still a weak fit
+  regardless of the adjacency correction — this conclusion doesn't change.
+- **(D) CondInst-style dynamic-convolution instance segmentation.** Keeps a
+  box-based (FCOS) detection front end for instance identification but
+  generates each mask via per-instance dynamic convolutions over the *full*
+  feature map — no RoIAlign crop. This is the architecture the in-domain solar
+  filament paper (§ "directly in-domain" evidence, `learning.md`) actually
+  used, successfully, on this exact modality. Fixes the fill-ratio problem
+  directly; a box-based front end could still under-count faint filaments if
+  its objectness/centerness scoring is miscalibrated for low-contrast
+  targets — a detection-recall risk, distinct from a separation risk.
+- **(E) Mask2Former-style mask-classification transformer.** Previously
+  shelved as "too data-hungry for 707 labels" — that was asserted, not
+  measured, and asserted inconsistently: the parent plan is a whole
+  self-supervised pretraining program built to solve label scarcity for the
+  embedding path's encoder, and COCO/ADE-pretrained Mask2Former checkpoints
+  exist off the shelf, requiring no domain SSL investment to try at all. It's
+  also the architecture panoptic segmentation's own leaderboards actually
+  converged on. Given the adjacency finding, its query-based grouping isn't
+  even solving a hard problem in this data — meaning if it works, it's likely
+  via detection quality (RQ, recall on faint filaments) and mask quality (SQ),
+  not because grouping was hard. **Reopened as a live candidate, not shelved.**
+
+**No preference stated here.** The next step is measurement, not another round
+of architecture comparison from first principles: run the per-image
+error-analysis pass (failure-type × SQ/RQ breakdown) on the current baseline's
+real predictions. Concrete falsification criteria to apply once that exists:
+
+- If merge-errors are a small fraction (rough working threshold: <10%) of
+  total RQ loss → do not adopt embedding clustering for its core mechanism;
+  its main selling point doesn't target the actual error source.
+- If boundary IoU is the dominant SQ loss even on correctly-matched instances
+  → prioritize a box-free *mask head* (CondInst or Mask2Former) over pure
+  clustering, since that's a mask-quality problem, not a separation problem.
+- If missed low-contrast filaments dominate RQ loss → prioritize detection
+  recall (confidence threshold, hard-negative mining, or a strong pretrained
+  detector/transformer) over any instance-separation mechanism at all —
+  separation can't help with an instance that was never detected.
+
+Target: run this measurement before committing further engineering to any of
+(B)/(D)/(E) — this is a cheap, existing-tooling pass, not a new architecture.
+
+### 5.2 Encoder: ResNet vs. ViT
+
+**ResNet (CNN).**
+- *Pros:* convolutional inductive bias (locality, translation equivariance) is a
+  strong prior that directly compensates for a small labeled set (707 images);
+  mature ImageNet-pretrained weights; already working with 1-channel input via a
+  straightforward stem adaptation (`jp-mvp1`'s `smp.Unet` does this today);
+  cheaper to train, faster iteration.
+- *Cons:* lower ceiling than a well-pretrained ViT *if* the domain-specific SSL
+  corpus (GONG Hα) carries transferable signal ImageNet genuinely lacks; weaker
+  at modeling long-range context (e.g., relating distant parts of one curving
+  filament) without deep stacking or dilation.
+
+**ViT (Transformer), MAE-pretrained.**
+- *Pros:* global self-attention naturally models long-range structure, which
+  could matter for elongated, curving filaments; can absorb the large *unlabeled*
+  domain corpus (8.5K-49K images) directly via MAE, a pretraining story ResNet
+  doesn't have as cleanly.
+- *Cons:* no built-in locality/equivariance prior — needs much more labeled data
+  or very strong pretraining to compensate, and 707 labeled images is not much;
+  materially higher overfitting/forgetting risk during fine-tuning (5.6); still
+  unproven for this project specifically — Stage 3's MAE pretraining hasn't been
+  run yet, so this option carries real unresolved technical risk (does the
+  pretrain even converge well on this corpus?) that ResNet+ImageNet doesn't.
+
+**Preference: ResNet (`resnet34`) as the primary/production path; ViT-MAE stays a
+gated secondary track**, promoted only if the mandatory ablation (5.3) shows it
+beating the ResNet baseline's *real* local PQ — not just beating a scratch or
+ImageNet-init ViT, which would only prove pretraining helped some ViT, not that
+ViT beats the simpler, safer CNN.
+
+### 5.3 Pretraining strategy per encoder
+
+**For ResNet:**
+
+*Option 1 — ImageNet weights only (current `jp-mvp1` default).*
+Pros: zero extra engineering/compute, already the working starting point, and
+ImageNet features are already known to transfer reasonably to this grayscale
+domain (the existing baseline runs on exactly this). Cons: no domain adaptation
+to Hα-specific texture (limb darkening, plage, filament threading) that a
+domain-specific SSL pass could target directly.
+
+*Option 2 — Domain SSL on the GONG Hα corpus (BYOL/MoCo contrastive, or a
+CNN-adapted masked-modeling method like SparK), starting from ImageNet weights.*
+Pros: could close the same kind of domain gap MAE is meant to close for ViT,
+giving a fair "does domain pretraining help at all" comparison across both
+encoder families instead of only ViT getting that investment. Cons: a second,
+CNN-specific SSL pipeline, distinct from Stage 3's ViTMAE code — real engineering
+cost for a benefit that's unproven until measured.
+
+**Preference: start with Option 1 for ResNet — it's free and already the working
+baseline.** Only build Option 2 if the ViT-MAE ablation shows domain pretraining
+is genuinely valuable for this corpus/task at all; don't build two speculative SSL
+pipelines before either is proven once.
+
+**For ViT:**
+
+*Option 1 — MAE pretraining on the GONG Hα corpus (Stage 3, already planned).*
+Pros: domain-adapted features, potentially large gain if ImageNet-style features
+transfer poorly to full-disk Hα imagery; the corpus itself (8.5K-49K images) is
+already a real, in-progress asset. Cons: unproven — Stage 3 isn't implemented/run
+yet; real risk the pretrain doesn't pay off or overfits its own pretext task
+(4.5); the most compute-expensive of the three (multi-session Kaggle DDP).
+
+*Option 2 — ImageNet-pretrained ViT, channel-adapted to 1-channel input.*
+Pros: cheap, immediate, tests whether ViT-as-architecture is viable at all before
+committing to Stage 3's investment. Cons: 3-channel-to-1-channel patch-embed
+adaptation is lossier for a ViT than a ResNet stem conv (no equivalent to `smp`'s
+clean channel-averaging trick in standard ViT loaders); still doesn't close the
+domain gap.
+
+*Option 3 — Scratch ViT, no pretraining.*
+Pros: simplest to implement, serves as the ablation's own negative control. Cons:
+essentially guaranteed to underperform given ~707 labeled images and no inductive
+bias — its only purpose is calibrating how much Options 1-2 actually contribute.
+
+**Preference: run all three as the mandatory ablation already specified** — but
+sequence it *after* the ResNet baseline (with whichever segmentation head §5.1's
+error-analysis measurement actually selects — not necessarily the embedding
+head) has a real local PQ number, since that's the number every ViT variant
+actually has to beat to be worth adopting, not just an academic comparison
+among ViT variants themselves.
+
+### 5.4 Loss function
+
+The current MVP1 target is a single binary semantic mask (union of instance
+polygons; instance separation happens later via postprocessing — see
+`jp-mvp1:src/dataset.py`'s `FilamentDataset` docstring), and filaments are thin,
+elongated, and a small minority of pixels per frame. Plain BCE or plain Dice each
+have known failure modes here (BCE: dominated by the easy background majority;
+Dice alone: unstable gradients when a batch's positive mask is tiny or empty,
+which happens here — MVP1 deliberately keeps filament-free frames as valid
+negatives).
+
+- **Primary: Tversky loss + BCE**, `loss = 0.5 * BCE + Tversky(alpha=0.3, beta=0.7)`.
+  Tversky generalizes Dice with independent false-positive/false-negative weights;
+  `alpha < beta` biases the loss toward recall, which matters because thin
+  structures are the ones a model under-predicts first, and per `kaggle.md`'s own
+  error-analysis finding, false negatives/positives here were shape-indistinguishable
+  — meaning the model's discrimination, not obviously the loss's FP/FN balance, was
+  the deeper issue; still, starting recall-biased is the safer default for thin
+  positives and is cheap to re-tune once real error-analysis tooling (kaggle.md
+  Month 2 Step 3) is in place.
+- **Add a boundary-aware term once the plain Tversky+BCE baseline is running**:
+  a distance-transform-weighted BCE, or clDice (centerline Dice — designed
+  specifically for thin/tubular structures like vessels, directly applicable to
+  filaments) as a secondary term. This is a `kaggle.md` Month-2-Step-5 item
+  (architecture/loss changes justified by a specific finding), not a day-one
+  requirement — don't add it before the plain baseline's error analysis says
+  boundary localization specifically is the gap.
+- Keep loss changes isolated per `kaggle.md`'s Step 4: don't change the loss and
+  the architecture in the same run, or a PQ delta can't be attributed to either.
+
+### 5.5 Optimizer, LR schedule, and layer-wise decay
+
+Both branches share the same shape — **discriminative (layer-wise) LR decay**, a
+short warmup, then cosine decay to 0, with the pretrained encoder kept an order of
+magnitude "colder" than the fresh decoder head so the head's initially-random
+gradients don't blow away pretrained features before it has learned anything
+useful to backprop:
+
+```python
+def layerwise_lr(depth_from_input, num_layers, head_lr, decay=0.75):
+    # depth_from_input=0 is the stem/first block; num_layers-1 is the block
+    # nearest the decoder. Deeper (more task-specific) layers get less decay.
+    return head_lr * (decay ** (num_layers - 1 - depth_from_input))
+```
+
+- **ResNet + U-Net branch**: `head_lr = 1e-3` (decoder + final layer), encoder LR
+  decayed per ResNet stage (`decay ≈ 0.7-0.8`, 5 stages) down to roughly `1e-5` at
+  the stem. AdamW, `weight_decay = 1e-4`. Warmup 3-5 epochs (linear), then cosine
+  to 0. Total budget ~40-60 epochs, but gate on early stopping (below), not a
+  fixed count — 1,039 images trains fast enough per epoch that overshooting the
+  useful range costs wall-clock, not much else.
+- **ViT-MAE branch**: `head_lr = 1e-3`, `decay ≈ 0.65-0.75` across the 12 ViT
+  blocks (this range matches published MAE fine-tuning recipes, which is exactly
+  the setting this schedule is adapted from), floor around `1e-5` at the earliest
+  blocks. AdamW, `weight_decay = 0.05` (kept consistent with Stage 3's own
+  pretraining wd). Warmup ~5-10% of total epochs. Transformers typically need a
+  longer fine-tune schedule than a CNN to reach the same point on a small dataset,
+  but weigh that against section 5.6's overfitting risk at this label count —
+  don't just extend epochs to compensate without watching val loss.
+- **Batch size**: moderate (16-32), not maximized — very small batches on a
+  1,039-image dataset add useful gradient noise as a mild regularizer, very large
+  batches don't help here and just reduce update count per epoch.
+- Mixed precision (already used in Stage 3) + gradient clipping (`max_norm=1.0`)
+  for stability — thin positive-heavy loss terms like Tversky can spike on a batch
+  with unusually large filament coverage.
+
+### 5.6 Avoiding overfitting and catastrophic forgetting at 707 labeled images
+
+This is the actual risk this plan needs to manage, more than picking an
+architecture:
+
+- **Encoder freeze warmup**: freeze the pretrained encoder entirely for the first
+  2-5 epochs, training only the fresh decoder/head. This lets the head reach a
+  sane starting point before its initially-large gradients start flowing back
+  into (and potentially wrecking) the pretrained encoder once unfrozen — cheap
+  insurance against forgetting in the first few unstable epochs.
+- **Layer-wise LR decay (5.5) is itself the primary forgetting guard** — it's not
+  just an optimization nicety here, it's what keeps early/mid encoder layers
+  close to their pretrained values while the decoder does most of the adapting.
+- **Linear-probe baseline as a forgetting tripwire**: before running the full
+  unfrozen fine-tune, train *only* a linear/shallow head on frozen pretrained
+  features and record that PQ/Dice number. If full fine-tuning ends up *below*
+  the frozen linear-probe result, that's a direct signal the unfrozen fine-tune is
+  destructively overwriting useful pretrained features rather than improving on
+  them — not just noise to shrug off.
+- **Augmentation, kept label-preserving**: rotation (any multiple of 90°, plus
+  free-angle) and flips are valid — there's no canonical "up" on the Sun, same
+  reasoning Stage 3 already uses (section 4.1). Gamma/contrast jitter, mild
+  Gaussian noise, coarse dropout patches. Avoid strong elastic/geometric warps
+  applied independently of the mask — filaments are thin curvilinear structures
+  and any augmentation must warp image and mask *jointly*, or a few pixels of
+  misalignment corrupts a large fraction of a thin positive region.
+- **Weight decay as an explicit anchor**, not just a generic regularizer — at this
+  label count, decay pulling weights toward zero also indirectly limits how far
+  they can drift from their (already-good) pretrained initialization within a
+  short fine-tune. If forgetting still shows up despite 5.3-5.4's other guards,
+  the next lever is literally penalizing distance from the pretrained weights
+  (L2-SP) rather than distance from zero — a documented technique, not implemented
+  here yet, worth trying only if the simpler guards above prove insufficient.
+- **Model selection: k-fold, not one split, once comparing architectures/losses.**
+  `kaggle.md` flags this for Month 3 in general, but it applies earlier here
+  specifically *because* the dataset is small enough that a single grouped
+  85/15 split's noise can plausibly exceed the gap between e.g. ResNet18 vs.
+  ResNet34, or Tversky vs. Tversky+boundary-term. Use `jp-mvp1`'s existing
+  `group_split` grouping logic, repeated across ≥3-5 folds/seeds, before trusting
+  a comparison enough to act on it.
+- **Early stopping on local PQ, not train loss or even val Dice** — `jp-mvp1`
+  already has a real PQ implementation (`src/metrics.py`); use it as the actual
+  selection criterion, since Dice/BCE convergence doesn't guarantee good instance
+  separation after postprocessing (the postprocessing step itself already moved
+  PQ by 8x in `kaggle.md`'s own account, independent of the model).
+
+### 5.7 Resolution mismatch to resolve before the ablation is fair
+
+`jp-mvp1:src/dataset.py`'s `FilamentDataset` currently defaults to `img_size=256`;
+Stage 3's MAE pretraining crops at `384` (section 4.1). Running the ResNet-vs-ViT
+ablation at two different input resolutions would confound architecture with
+resolution, exactly the single-variable violation `kaggle.md` Step 4 warns about.
+Pick one fine-tuning resolution for the ablation (384, to match what the ViT
+encoder was actually pretrained at — a ViT's positional embeddings are tied to
+patch grid size, so mismatching resolution here also means interpolating position
+embeddings, an extra confound) and hold it fixed across both branches; a
+resolution sweep is a legitimate follow-up (per `kaggle.md`'s resolution/VRAM
+notes) but only after the architecture question itself is settled on equal footing.
 
 ---
 
@@ -520,8 +922,35 @@ Launch cell:
       the account (varies by verification tier) rather than assuming 8h flat.
 - [ ] Tune `--day-stride` / `--max-images` once a real manifest is built, so the
       final downloaded corpus actually lands in the 5-10K target range.
+- [ ] Add the section 4.5 held-out date-grouped split to `HalphaMAEDataset`/
+      `train_ddp.py` — currently trains on the full manifest with no val signal.
+- [ ] Download the full 707-unique-image MAGFiLO train set locally (only 20 sample
+      images present as of this plan revision) before any Stage 4 fine-tuning run.
+- [ ] **Blocking the rest of 5.1's decision:** run `kaggle.md`'s Month-2 Step 3
+      per-image error-analysis tooling against the current `jp-mvp1` baseline's
+      real predictions, classified by failure type (missed / fragmented /
+      merged / poor-boundary) and split into SQ vs. RQ contribution. Nothing
+      below should be built until this exists — see 5.1's falsification
+      criteria for what result points at which candidate.
+- [ ] Once that measurement picks a segmentation head (embedding head, CondInst,
+      or Mask2Former per 5.1), implement it on top of `jp-mvp1`'s existing
+      decoder output (or replace the decoder entirely, if Mask2Former) — new
+      code, not yet built or validated against real data either way.
+- [ ] Bump `jp-mvp1:src/model.py`'s baseline from `resnet18` to `resnet34` and
+      re-run it (with whichever head 5.1 selects) as the number the ViT-MAE
+      ablation (5.2, 5.3) actually has to beat.
+- [ ] Resolve the 256px (`jp-mvp1` default) vs. 384px (Stage 3 crop) mismatch
+      (5.7) before running the ablation.
+- [ ] Implement the linear-probe forgetting tripwire (5.6) alongside the first
+      full fine-tune run, not after — it's cheap and is the earliest signal that
+      something in 5.5's LR schedule is off.
 
 Pretraining is complete once Stage 3's masked-reconstruction quality plateaus
-(loss curve + visual check) and the Stage 4 ablation shows the MAE-pretrained
-encoder beating scratch/ImageNet-init on local Dice/PQ — at that point the
-resulting encoder checkpoint is the deliverable this whole plan exists to produce.
+(loss curve + val loss from 4.5 not diverging from train) and the Stage 4
+ablation (5.2, 5.3) shows the MAE-pretrained encoder beating both scratch/
+ImageNet-init ViT *and* the ResNet34 baseline (whichever head 5.1's measurement
+selects) on local PQ — at that point the resulting encoder checkpoint is the
+deliverable this whole plan exists to produce. If it only beats scratch/
+ImageNet-init ViT but not the ResNet baseline, that's a valid outcome too — it
+means ship the ResNet baseline and treat the SSL investment as a documented
+negative result, not a reason to keep sinking compute into it.

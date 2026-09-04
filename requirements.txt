@@ -32,6 +32,9 @@ kaggle
 jupyterlab
 ipykernel
 
+# Data browsing/labeling tools
+streamlit
+
 # Config / experiment tracking (optional, uncomment as needed)
 # pyyaml
 # mlflow

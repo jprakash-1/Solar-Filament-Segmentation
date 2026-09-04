@@ -199,6 +199,28 @@ def nearest_per_hour(frames: list[FrameRef], tolerance_minutes: int = 20) -> lis
     return sorted(by_hour.values(), key=lambda f: f.timestamp)
 
 
+def thin_per_day(frames: list[FrameRef], per_day: int | None) -> list[FrameRef]:
+    """Keep at most `per_day` frames out of one (site, day)'s hourly frames,
+    picked at evenly-spaced quantile positions (e.g. per_day=2 -> the frames
+    nearest the 25th/75th percentile time) so they're spread across the
+    middle of the site's daylight window rather than the possibly
+    limb-grazing first/last hour. `frames` is assumed already sorted by
+    timestamp (true of `nearest_per_hour`'s output) and to be a single (site,
+    day)'s frames, since this is called per listing task in `build_manifest`.
+
+    Mirrors `thin_manifest.py`'s post-hoc selection logic (see
+    PRETRAIN_PLAN.md for the SSIM measurements motivating it), but applied at
+    manifest-build time so a fresh download doesn't fetch hourly frames only
+    to discard most of them afterward -- `per_day=None` (the default) keeps
+    the old ~1/hour behavior for callers that still want the full cadence."""
+    n = len(frames)
+    if per_day is None or n <= per_day:
+        return frames
+    idxs = sorted({round((i + 0.5) * n / per_day - 0.5) for i in range(per_day)})
+    idxs = [min(max(i, 0), n - 1) for i in idxs]
+    return [frames[i] for i in idxs]
+
+
 def _enumerate_tasks(sites: list[str], date_ranges: list[tuple[date, date]], day_stride: int) -> list[tuple[str, date]]:
     tasks = []
     for start, end in date_ranges:
@@ -219,12 +241,20 @@ def build_manifest(
     checkpoint_path: Path | None = None,
     progress_every: int = 20,
     workers: int = 4,
+    per_day_site: int | None = 2,
 ) -> list[FrameRef]:
     """Walk the given date ranges (stepping every `day_stride` days) and
-    collect ~1 frame/hour per site, `workers` (site, day) listings at a time.
-    Ground telescopes only see the Sun during local daytime, so expect well
-    under 24 frames/site/day, not a full day's worth -- that's normal, not a
-    bug.
+    collect up to `per_day_site` frames/day per site (default 2, spread
+    across the day -- see `thin_per_day`), `workers` (site, day) listings at
+    a time. Ground telescopes only see the Sun during local daytime, so
+    expect well under 24 frames/site/day even before this thinning, not a
+    full day's worth -- that's normal, not a bug.
+
+    `per_day_site=2` is the default (not the old ~1/hour) because measuring
+    the already-downloaded corpus showed same-site consecutive-hour frames
+    average SSIM 0.91 (85% exceed 0.90) -- see PRETRAIN_PLAN.md. Fetching
+    hourly and thinning after the fact wastes the download itself; passing
+    `per_day_site=None` restores the old full-cadence behavior.
 
     Logs a running "N/total" progress line every `progress_every` completed
     listings (wall-clock alone isn't a reliable progress signal -- any single
@@ -279,7 +309,8 @@ def build_manifest(
     progress_log = open(progress_log_path, "a") if progress_log_path else None
 
     def _worker(site_letter: str, day: date) -> list[FrameRef]:
-        return nearest_per_hour(list_day_files(site_letter, day), tolerance_minutes)
+        hourly = nearest_per_hour(list_day_files(site_letter, day), tolerance_minutes)
+        return thin_per_day(hourly, per_day_site)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_worker, site_letter, day): (site_letter, day) for site_letter, day in remaining_tasks}
@@ -420,6 +451,9 @@ def parse_args() -> argparse.Namespace:
                     help="one or more START:END dates (YYYY-MM-DD), e.g. a quiet-sun and an active-sun window")
     m.add_argument("--day-stride", type=int, default=3, help="sample every Nth day within each range")
     m.add_argument("--tolerance-minutes", type=int, default=20)
+    m.add_argument("--per-day-site", type=int, default=2,
+                    help="max frames to keep per (site, day), spread across the day (pass 0 to disable "
+                         "and keep the old ~1/hour cadence -- see thin_per_day)")
     m.add_argument("--max-images", type=int, default=10000)
     m.add_argument("--out", type=Path, default=Path("data/raw/gong_pretrain/manifest.csv"))
     m.add_argument("--workers", type=int, default=4, help="concurrent listing requests")
@@ -450,6 +484,7 @@ def main() -> None:
             max_images=args.max_images,
             checkpoint_path=args.out,
             workers=args.workers,
+            per_day_site=args.per_day_site or None,
         )
         write_manifest_csv(manifest, args.out)
         logger.info(f"wrote {len(manifest)} rows to {args.out}")
