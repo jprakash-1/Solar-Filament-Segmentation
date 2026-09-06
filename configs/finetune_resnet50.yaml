@@ -40,6 +40,11 @@ train:
   epochs: 30
   batch_size: 8  # local Mac default -- see configs/finetune_resnet50_kaggle.yaml for
                  # why this needs to shrink drastically on a real GPU at img_size=2048
+  grad_accum_steps: 1  # >1 recovers a larger effective batch size at a smaller
+                       # batch_size's memory footprint -- the lever to reach for on
+                       # OOM instead of lowering batch_size outright
+  early_stopping_patience: 0  # 0 disables; stop if val PQ hasn't improved for this
+                              # many consecutive epochs otherwise
   num_workers: 0
   amp: auto  # CUDA only in practice -- no-op on local CPU/MPS runs
 

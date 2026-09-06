@@ -127,6 +127,30 @@ catches the exact class of bug §11 already found once for the ImageNet stem pat
     still produces at true native resolution.
   - Checkpoint now persists `encoder_name` (and `loss`), not just `img_size` —
     needed by `src/infer.py` to reconstruct the right architecture.
+  - `find_unused_parameters=True` on the DDP wrapper whenever `fine_tuning` is
+    True — required because the freeze-warmup schedule changes which
+    parameters receive gradients from epoch to epoch, which DDP's default
+    (`find_unused_parameters=False`) doesn't tolerate. **Found the hard way**:
+    this crashed a real Kaggle T4 x2 run on the very first training step
+    (`RuntimeError: Expected to have finished reduction in the prior
+    iteration...`, every frozen encoder parameter listed as unused) — fixed
+    directly from that traceback, which already named the fix.
+  - `--grad-accum-steps` (default 1) — accumulates gradients over N
+    micro-batches per optimizer step, recovering a larger effective batch size
+    at a smaller `--batch-size`'s peak memory. Under DDP, all but the last
+    micro-batch of each cycle runs inside `model.no_sync()` so gradients only
+    all-reduce once per optimizer step, not once per micro-batch (PyTorch's own
+    documented pattern, not novel) — this is the lever `configs/finetune_resnet50_kaggle.yaml`
+    now recommends reaching for on OOM instead of lowering `--batch-size`
+    outright.
+  - `--early-stopping-patience` (default 0, disabled) — stops training if val
+    PQ hasn't improved for that many consecutive epochs. Only rank 0 runs
+    validation, so its stop decision is broadcast to every rank before any rank
+    acts on it (`dist.broadcast` after the existing barrier) — the same
+    per-rank-independent-decision hazard this file already avoided for the
+    freeze-warmup fix and that `PRETRAIN_PLAN.md`'s `train_ddp.py` sketch flags
+    for wall-clock-based stopping; letting rank 0 break out alone would hang
+    every other rank at its next collective op.
 - **`src/infer.py`**: `load_model()` reads `encoder_name` back out of the
   checkpoint (defaults to `"resnet18"` for older `jp-mvp1` checkpoints saved
   before this field existed) and builds with `encoder_weights=None` (every
@@ -151,6 +175,22 @@ catches the exact class of bug §11 already found once for the ImageNet stem pat
   values, val PQ is computed and used for checkpoint selection, and
   `src/infer.py` reconstructs the resnet50 architecture from the checkpoint's
   `encoder_name` field correctly for both `--split val` and `--split test`.
+- `--grad-accum-steps` verified on a synthetic dataset sized to force a
+  trailing partial accumulation cycle (7 train images, batch-size 2,
+  grad-accum-steps 3 → micro-batch sizes `[2,2,2,1]`) — runs cleanly across
+  epochs. `--early-stopping-patience` verified to stop training at the correct
+  epoch (patience=1 with a frozen/non-improving run stopped after 2 epochs of a
+  10-epoch budget, logging why).
+- **A second bug found while re-testing the notebook after these additions**:
+  `finetune_resnet50_kaggle.ipynb`'s dependency-install cell had `\\b` (two
+  literal backslashes) instead of `\b` (a regex word boundary) in its
+  `grep -v -E "^(torch|torchvision)\b"` pattern — a Python string-escaping slip
+  in how this file generated the notebook, not present in `jp-mvp1`'s original
+  `train_mvp1_kaggle.ipynb` this was modeled on. With the extra backslash, the
+  pattern would have matched `torchmetrics` too (no working word-boundary),
+  silently skipping its install. Fixed by copying the exact, already-proven
+  cell source from `train_mvp1_kaggle.ipynb` and confirming the corrected
+  pattern excludes exactly `torch`/`torchvision` while keeping `torchmetrics`.
 - **Not yet run**: anything at real scale (real MAGFiLO data, real BYOL
   checkpoint, real GPU) — both currently exist only on Kaggle (data) and either
   on Kaggle or not yet at all (checkpoint; the BYOL pretraining run's own

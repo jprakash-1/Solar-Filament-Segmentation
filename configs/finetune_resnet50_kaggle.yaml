@@ -43,15 +43,20 @@ train:
   encoder_lr_decay: 0.75
   freeze_epochs: 3
   epochs: 30
-  batch_size: 2  # PER GPU under DDP. Deliberately conservative, NOT measured on real
-                 # hardware yet -- jp-mvp1's own two reference points (256px/batch 64,
-                 # 1024px/batch 8) both ran far lighter workloads than a ResNet50 U-Net
-                 # at full 2048x2048. Re-tune empirically on the first real run
-                 # (kaggle.md's own "re-tune batch size every time you change
-                 # resolution" guidance) -- raise if GPU memory sits mostly unused,
-                 # lower (there isn't much room below 2) if it OOMs -- gradient
-                 # checkpointing is the next lever if batch-size-1 with AMP still OOMs,
-                 # not yet implemented since it isn't needed until proven necessary.
+  batch_size: 4  # PER GPU under DDP. Raised from an initial guess of 2 -- still NOT
+                 # measured against real hardware, jp-mvp1's own two reference points
+                 # (256px/batch 64, 1024px/batch 8) both ran far lighter workloads than
+                 # a ResNet50 U-Net at full 2048x2048. Re-tune empirically on the first
+                 # real run (kaggle.md's own "re-tune batch size every time you change
+                 # resolution" guidance) -- if this OOMs, --grad-accum-steps (e.g. 2)
+                 # recovers the same effective batch size at batch_size=2's memory
+                 # footprint instead of lowering batch_size outright; gradient
+                 # checkpointing is the next lever after that, not yet implemented
+                 # since it isn't needed until proven necessary.
+  grad_accum_steps: 1  # bump this (and lower batch_size back down) instead of raising
+                       # batch_size further if a run OOMs -- same effective batch size,
+                       # lower peak memory. See src/train.py's run_train_epoch docstring.
+  early_stopping_patience: 5  # stop if val PQ hasn't improved in 5 epochs -- 0 disables
   num_workers: 4
   amp: auto  # mixed precision -- close to a requirement at this resolution on a T4's 16GB
   checkpoint_out: outputs/checkpoints/finetune_resnet50_kaggle.pt

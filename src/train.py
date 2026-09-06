@@ -44,6 +44,8 @@ import argparse
 import csv
 from pathlib import Path
 
+from contextlib import nullcontext
+
 import albumentations as A
 import cv2
 import numpy as np
@@ -82,6 +84,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--img-size", type=int, default=2048, help="native resolution by default -- no downsampling (see module docstring)")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=8, help="per-process under DDP; re-tune empirically at img-size=2048, 8 is almost certainly too large on a 16GB GPU")
+    p.add_argument("--grad-accum-steps", type=int, default=1, help="accumulate gradients over this many micro-batches before each optimizer step -- simulates a larger effective batch size at the same peak memory as --batch-size; 1 disables accumulation (unchanged behavior)")
     p.add_argument("--num-workers", type=int, default=0, help="DataLoader worker processes; keep 0 for local CPU/MPS debugging, raise (e.g. 4) on GPU to stop data loading from bottlenecking GPU utilization")
     p.add_argument("--val-fraction", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=0)
@@ -105,6 +108,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--freeze-epochs", type=int, default=3, help="epochs (1-indexed, inclusive) during which the encoder is frozen before unfreezing")
     p.add_argument("--linear-probe-only", action="store_true", help="freeze the encoder for the entire run (forgetting-tripwire baseline, PRETRAIN_PLAN.md section 5.6) -- overrides --freeze-epochs")
+    p.add_argument("--early-stopping-patience", type=int, default=0, help="stop training if val PQ hasn't improved for this many consecutive epochs; 0 disables early stopping (train the full --epochs)")
 
     # Mixed precision
     p.add_argument("--amp", choices=["auto", "on", "off"], default="auto", help="auto enables AMP only on CUDA; MPS/CPU autocast support is inconsistent enough not to default it on")
@@ -213,26 +217,57 @@ def resolve_device(requested: str | None) -> torch.device:
 # Train / validate
 # ---------------------------------------------------------------------------
 
-def run_train_epoch(model, loader, device, optimizer, loss_fn, scaler, use_amp) -> tuple[float, float]:
+def run_train_epoch(model, loader, device, optimizer, loss_fn, scaler, use_amp, grad_accum_steps=1, distributed=False) -> tuple[float, float]:
+    """grad_accum_steps > 1 accumulates gradients over that many micro-batches
+    before each optimizer step, simulating a larger effective batch size at the
+    same peak memory as --batch-size -- the practical lever for the img_size=2048
+    memory pressure this branch's own docs already flag (see
+    configs/finetune_resnet50_kaggle.yaml). The loss is divided by
+    grad_accum_steps before backward() so accumulated gradients end up scaled the
+    same as a single larger batch would produce, not grad_accum_steps times too
+    large. A trailing partial cycle (epoch length not a multiple of
+    grad_accum_steps) still gets a final optimizer step over however many
+    micro-batches it actually accumulated -- a minor, standard, widely-accepted
+    approximation, not treated as a bug.
+
+    Under DDP, all but the last micro-batch of each accumulation cycle runs
+    inside model.no_sync(): DDP's default all-reduces gradients on every
+    backward() call, which would otherwise mean grad_accum_steps synchronizations
+    per optimizer step instead of one. no_sync() only changes *when*
+    communication happens (once per optimizer step instead of once per
+    micro-batch); the accumulated local gradients are numerically identical
+    either way. This is PyTorch's own documented pattern for combining DDP with
+    gradient accumulation, not a novel trick.
+    """
     model.train()
     total_loss, total_dice, n_batches = 0.0, 0.0, 0
-    for img, mask, _image_ids, _orig_size in loader:
+    n_micro = len(loader)
+    optimizer.zero_grad()
+    for step, (img, mask, _image_ids, _orig_size) in enumerate(loader):
         img, mask = img.to(device), mask.to(device)
-        optimizer.zero_grad()
-        with torch.autocast(device_type=device.type, enabled=use_amp):
-            logits = model(img)
-            loss = loss_fn(logits, mask)
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            optimizer.step()
+        is_cycle_end = ((step + 1) % grad_accum_steps == 0) or (step == n_micro - 1)
+        sync_ctx = model.no_sync() if (distributed and not is_cycle_end) else nullcontext()
+        with sync_ctx:
+            with torch.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(img)
+                loss = loss_fn(logits, mask)
+            scaled_loss = loss / grad_accum_steps
+            if scaler is not None:
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+
+        if is_cycle_end:
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
 
         preds = (torch.sigmoid(logits) > 0.5).float()
         batch_dice = float(torch.mean(torch.tensor([dice_score(preds[i, 0].detach().cpu().numpy() > 0, mask[i, 0].cpu().numpy() > 0) for i in range(preds.shape[0])])))
-        total_loss += loss.item()
+        total_loss += loss.item()  # unscaled per-micro-batch loss, for logging -- not divided by grad_accum_steps
         total_dice += batch_dice
         n_batches += 1
     return total_loss / n_batches, total_dice / n_batches
@@ -367,6 +402,8 @@ def main() -> None:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=fine_tuning)
 
     best_val_pq = -1.0
+    epochs_since_improvement = 0
+    early_stop_signal = torch.zeros(1, device=device) if distributed else None
     if is_main:
         args.checkpoint_out.parent.mkdir(parents=True, exist_ok=True)
         args.log_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -382,11 +419,12 @@ def main() -> None:
 
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        train_loss, train_dice = run_train_epoch(model, train_loader, device, optimizer, loss_fn, scaler, use_amp)
+        train_loss, train_dice = run_train_epoch(model, train_loader, device, optimizer, loss_fn, scaler, use_amp, args.grad_accum_steps, distributed)
 
         if distributed:
             dist.barrier()  # keep other ranks from racing ahead into next epoch while rank 0 validates/checkpoints
 
+        should_stop = False
         if is_main:
             # Validate through the unwrapped module -- DDP broadcasts BatchNorm
             # buffers on every forward() by default, and this loop only runs on
@@ -405,6 +443,7 @@ def main() -> None:
 
             if val_pq["mean_per_image_pq"] > best_val_pq:
                 best_val_pq = val_pq["mean_per_image_pq"]
+                epochs_since_improvement = 0
                 torch.save(
                     {
                         "model_state_dict": plain_model.state_dict(),
@@ -420,9 +459,26 @@ def main() -> None:
                     args.checkpoint_out,
                 )
                 print(f"  -> saved new best checkpoint (val_pq={best_val_pq:.4f}) to {args.checkpoint_out}")
+            else:
+                epochs_since_improvement += 1
+                if args.early_stopping_patience > 0 and epochs_since_improvement >= args.early_stopping_patience:
+                    print(f"Early stopping: val PQ hasn't improved for {epochs_since_improvement} epochs (patience={args.early_stopping_patience}, best={best_val_pq:.4f})")
+                    should_stop = True
 
         if distributed:
             dist.barrier()  # don't let other ranks start the next epoch until rank 0's validation/checkpoint is done
+            # Broadcast rank 0's stop decision -- only rank 0 runs validation, so
+            # it's the only rank that knows whether patience has been exceeded.
+            # Letting rank 0 break out alone (without telling the others) would
+            # hang every other rank at its next collective op -- the same
+            # per-rank-independent-decision hazard this file's docstring already
+            # flags for wall-clock-based stopping, applied here to early stopping.
+            early_stop_signal.fill_(1.0 if should_stop else 0.0)
+            dist.broadcast(early_stop_signal, src=0)
+            should_stop = early_stop_signal.item() > 0
+
+        if should_stop:
+            break
 
     if is_main:
         print(f"Done. Best val_pq={best_val_pq:.4f}, checkpoint at {args.checkpoint_out}")
