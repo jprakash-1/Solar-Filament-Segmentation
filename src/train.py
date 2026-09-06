@@ -56,6 +56,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from src.dataset import FilamentDataset, group_split
@@ -93,6 +94,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--latest-checkpoint-out", type=Path, default=Path("outputs/checkpoints/finetune_resnet50_latest.pt"), help="saved unconditionally every epoch (model+optimizer+scaler+schedule state) so a killed/interrupted run can resume -- see --resume")
     p.add_argument("--resume", type=Path, default=None, help="path to a --latest-checkpoint-out checkpoint to resume from -- restores model/optimizer/scaler/epoch/best-val-PQ/early-stopping state and continues toward the same --epochs total (mirrors the multi-session Kaggle pattern RESNET_PRETRAIN_PLAN.md already uses for BYOL pretraining)")
     p.add_argument("--log-csv", type=Path, default=Path("outputs/logs/finetune_log.csv"), help="per-epoch train/val loss+dice+PQ, overwritten each run")
+    p.add_argument("--tensorboard-dir", type=str, default="outputs/tensorboard", help="TensorBoard log directory (same per-epoch scalars as --log-csv); pass an empty string to disable")
 
     # Encoder / architecture
     p.add_argument("--encoder-name", default="resnet18", help="smp.Unet encoder_name; use resnet50 with --encoder-checkpoint for the domain-pretrained path")
@@ -431,6 +433,7 @@ def main() -> None:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=fine_tuning)
 
     early_stop_signal = torch.zeros(1, device=device) if distributed else None
+    writer = None
     if is_main:
         args.checkpoint_out.parent.mkdir(parents=True, exist_ok=True)
         args.latest_checkpoint_out.parent.mkdir(parents=True, exist_ok=True)
@@ -443,6 +446,17 @@ def main() -> None:
         # session's curve, not a permanent record.
         with open(args.log_csv, "w", newline="") as f:
             csv.writer(f).writerow(["epoch", "train_loss", "train_dice", "val_loss", "val_dice", "val_pq_mean", "val_pq_pooled", "encoder_frozen"])
+
+        if args.tensorboard_dir:
+            # Not reset on resume, and not reopened in append mode either --
+            # SummaryWriter always starts a fresh event file, but since scalars
+            # are logged against the absolute epoch number (not reset to 0 on
+            # resume), TensorBoard's own event-file-merging in a shared logdir
+            # renders a continuous curve across a resumed run, no extra
+            # handling needed. Same log dir for the whole run either way.
+            tb_dir = Path(args.tensorboard_dir)
+            tb_dir.mkdir(parents=True, exist_ok=True)
+            writer = SummaryWriter(log_dir=str(tb_dir))
 
     if is_main and start_epoch > args.epochs:
         print(f"--resume checkpoint is already at epoch {start_epoch - 1} >= --epochs {args.epochs} -- nothing to do.")
@@ -477,6 +491,19 @@ def main() -> None:
 
             with open(args.log_csv, "a", newline="") as f:
                 csv.writer(f).writerow([epoch, train_loss, train_dice, val_loss, val_dice, val_pq["mean_per_image_pq"], val_pq["pooled_pq"], encoder_frozen])
+
+            if writer is not None:
+                writer.add_scalar("loss/train", train_loss, epoch)
+                writer.add_scalar("loss/val", val_loss, epoch)
+                writer.add_scalar("dice/train", train_dice, epoch)
+                writer.add_scalar("dice/val", val_dice, epoch)
+                writer.add_scalar("pq/val_mean", val_pq["mean_per_image_pq"], epoch)
+                writer.add_scalar("pq/val_pooled", val_pq["pooled_pq"], epoch)
+                writer.add_scalar("lr/head", optimizer.param_groups[-1]["lr"], epoch)
+                if fine_tuning:
+                    writer.add_scalar("lr/stem", optimizer.param_groups[0]["lr"], epoch)
+                writer.add_scalar("encoder_frozen", int(encoder_frozen), epoch)
+                writer.flush()  # so the live ngrok-tunneled dashboard updates without waiting for close()
 
             improved = val_pq["mean_per_image_pq"] > best_val_pq
             if improved:
@@ -547,6 +574,8 @@ def main() -> None:
 
     if is_main:
         print(f"Done. Best val_pq={best_val_pq:.4f}, checkpoint at {args.checkpoint_out}")
+        if writer is not None:
+            writer.close()
 
     if distributed:
         cleanup_distributed()

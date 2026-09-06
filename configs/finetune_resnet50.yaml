@@ -47,6 +47,8 @@ train:
                               # many consecutive epochs otherwise
   num_workers: 0
   amp: auto  # CUDA only in practice -- no-op on local CPU/MPS runs
+  tensorboard_dir: outputs/tensorboard  # per-epoch scalars, same as the CSV log;
+                                        # empty string disables
 
 checkpointing:
   checkpoint_out: outputs/checkpoints/finetune_resnet50.pt  # best-val-PQ only,

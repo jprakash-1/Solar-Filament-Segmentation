@@ -165,6 +165,16 @@ catches the exact class of bug §11 already found once for the ImageNet stem pat
     auto-detects a mounted `finetune_resnet50_latest.pt` from a prior session
     and passes `--resume` automatically; absent on a first session, same
     auto-detect-or-fall-back pattern the encoder-checkpoint cell already uses.
+  - `--tensorboard-dir` (default `outputs/tensorboard`, empty string disables)
+    — writes the same per-epoch scalars as the CSV log via
+    `torch.utils.tensorboard.SummaryWriter`, flushed every epoch so a live
+    dashboard doesn't wait for training to finish. Since Kaggle doesn't expose
+    arbitrary ports, `finetune_resnet50_kaggle.ipynb` §3.6 tunnels it out via
+    ngrok (needs the viewer's own free ngrok account/authtoken, read from a
+    Kaggle Secret — never hardcoded) rather than relying on Kaggle's own
+    proxying. Scalars are logged against the absolute epoch number, so a
+    resumed run's curve continues rather than resetting, with no extra
+    handling needed.
 - **`src/infer.py`**: `load_model()` reads `encoder_name` back out of the
   checkpoint (defaults to `"resnet18"` for older `jp-mvp1` checkpoints saved
   before this field existed) and builds with `encoder_weights=None` (every
@@ -202,6 +212,14 @@ catches the exact class of bug §11 already found once for the ImageNet stem pat
   restarting. Also checked the already-complete edge case (`--resume` a
   checkpoint whose `epoch` already meets `--epochs`) exits cleanly with a
   message instead of crashing or looping.
+- `--tensorboard-dir` verified by training 2 epochs and reading the written
+  event file back with TensorBoard's own `EventAccumulator` — all expected
+  scalar tags present with correct per-epoch values; `--tensorboard-dir ""`
+  confirmed to skip it entirely. The `tensorboard` CLI binary (what the
+  notebook's ngrok cell launches as a background process) confirmed to start
+  and terminate cleanly. `ngrok.connect()` itself not exercised (needs a real
+  account/authtoken this environment doesn't have) — the no-token fallback
+  path (prints a message, skips the tunnel) is what's actually verified.
 - **A second bug found while re-testing the notebook after these additions**:
   `finetune_resnet50_kaggle.ipynb`'s dependency-install cell had `\\b` (two
   literal backslashes) instead of `\b` (a regex word boundary) in its

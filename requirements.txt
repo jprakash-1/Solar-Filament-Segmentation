@@ -19,6 +19,11 @@ timm
 albumentations
 torchmetrics
 pycocotools
+tensorboard
+
+# Live TensorBoard dashboard on Kaggle (finetune_resnet50_kaggle.ipynb section 3.6)
+# -- unused locally, harmless to have installed either way
+pyngrok
 
 # Kaggle
 kaggle
