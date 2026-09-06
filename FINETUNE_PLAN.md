@@ -220,6 +220,18 @@ catches the exact class of bug §11 already found once for the ImageNet stem pat
   and terminate cleanly. `ngrok.connect()` itself not exercised (needs a real
   account/authtoken this environment doesn't have) — the no-token fallback
   path (prints a message, skips the tunnel) is what's actually verified.
+- **A real run hit `ERR_NGROK_15013`** ("requesting a dev domain that does not
+  exist") on the first attempt: `ngrok.connect()` without an explicit `domain=`
+  no longer works on ngrok's current free tier — confirmed against ngrok's own
+  docs (v2 agent config's `domain` field) after the error's suggested fix
+  wasn't obviously right from the error text alone. Fixed by passing
+  `domain=NGROK_DOMAIN` (the account's permanently-assigned dev domain, from
+  https://dashboard.ngrok.com/domains) explicitly. The domain itself isn't a
+  credential (grants nothing without `NGROK_AUTH_TOKEN`), so it's baked into
+  the notebook as a default, overridable via an `NGROK_DOMAIN` Kaggle Secret —
+  unlike the authtoken, which must never be hardcoded or committed (a real
+  token pasted into this session's chat was treated as compromised and the
+  user was told to rotate it, not stored anywhere in the repo).
 - **A second bug found while re-testing the notebook after these additions**:
   `finetune_resnet50_kaggle.ipynb`'s dependency-install cell had `\\b` (two
   literal backslashes) instead of `\b` (a regex word boundary) in its
