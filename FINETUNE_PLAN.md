@@ -232,6 +232,17 @@ catches the exact class of bug §11 already found once for the ImageNet stem pat
   unlike the authtoken, which must never be hardcoded or committed (a real
   token pasted into this session's chat was treated as compromised and the
   user was told to rotate it, not stored anywhere in the repo).
+- **The very next real run hit `ERR_NGROK_334`** ("already online") — a free
+  dev domain allows only one active endpoint at a time, and re-running the
+  cell (after the `ERR_NGROK_15013` fix) collided with a leftover local
+  `ngrok` agent process from the prior attempt. Fixed by calling
+  `ngrok.kill()` (terminates the local agent) before `ngrok.connect()`,
+  making the cell safe to re-run in the same kernel without a restart.
+  Noted in the markdown that if this *doesn't* fix it, the endpoint is
+  online from a genuinely different session (another kernel/machine) and
+  needs stopping from the ngrok dashboard directly — didn't guess an exact
+  dashboard URL for that since it couldn't be confirmed against ngrok's own
+  docs.
 - **A second bug found while re-testing the notebook after these additions**:
   `finetune_resnet50_kaggle.ipynb`'s dependency-install cell had `\\b` (two
   literal backslashes) instead of `\b` (a regex word boundary) in its
