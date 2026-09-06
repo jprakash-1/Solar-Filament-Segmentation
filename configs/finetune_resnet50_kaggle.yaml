@@ -1,0 +1,87 @@
+# Stage 4 fine-tuning settings record for the Kaggle GPU environment
+# (finetune_resnet50_kaggle.ipynb). Same caveat as configs/finetune_resnet50.yaml:
+# documentation of the CLI flags the notebook passes to src/train.py / src/infer.py,
+# not live-loaded by any script.
+#
+# Why this differs from configs/finetune_resnet50.yaml (local): local runs on a Mac
+# (MPS/CPU) exist only for structural smoke-testing at a tiny img_size (see
+# FINETUNE_PLAN.md's verification section) -- the real 2048px fine-tune only makes
+# sense on a real GPU.
+
+data:
+  # Auto-detected at runtime by globbing /kaggle/input for the annotation json and
+  # for a *.pt file with "encoder" in its name -- see finetune_resnet50_kaggle.ipynb
+  # section 2. Neither the competition-data mount folder nor the encoder-checkpoint
+  # dataset's exact slug is fixed here (the slug isn't decided yet).
+  data_json: <auto-detected under /kaggle/input, see notebook>
+  train_images_dir: <auto-detected>
+  test_images_dir: <auto-detected>
+  encoder_checkpoint: <auto-detected -- resnet50 BYOL encoder from jp-pretraining-data-prep's export_encoder.py, exported as its own Kaggle Dataset>
+  val_fraction: 0.15
+  split_group_key: file_name  # never image_id -- see src/dataset.py docstring
+  seed: 0
+
+model:
+  architecture: smp.Unet  # unchanged from jp-mvp1
+  encoder: resnet50
+  in_channels: 1
+  classes: 1
+  img_size: 2048  # native resolution -- unchanged from configs/finetune_resnet50.yaml,
+                  # this isn't a local-vs-Kaggle difference
+
+train:
+  launch: >-
+    NCCL_P2P_DISABLE=1 torchrun --nproc_per_node=<gpu count, auto-detected> -m src.train
+  # DDP across every visible GPU, same as jp-mvp1's train_mvp1_kaggle.ipynb -- see
+  # src/distributed.py and jp-mvp1's README "Known gotchas" for the NCCL fixes this
+  # reuses unchanged (device_id-explicit init_process_group, rank-0-only validation
+  # through the unwrapped module, NCCL_P2P_DISABLE=1 defensively).
+  loss: tversky_bce
+  optimizer: adamw
+  weight_decay: 1.0e-4
+  head_lr: 1.0e-3
+  encoder_lr_decay: 0.75
+  freeze_epochs: 3
+  epochs: 30
+  batch_size: 2  # PER GPU under DDP. Deliberately conservative, NOT measured on real
+                 # hardware yet -- jp-mvp1's own two reference points (256px/batch 64,
+                 # 1024px/batch 8) both ran far lighter workloads than a ResNet50 U-Net
+                 # at full 2048x2048. Re-tune empirically on the first real run
+                 # (kaggle.md's own "re-tune batch size every time you change
+                 # resolution" guidance) -- raise if GPU memory sits mostly unused,
+                 # lower (there isn't much room below 2) if it OOMs -- gradient
+                 # checkpointing is the next lever if batch-size-1 with AMP still OOMs,
+                 # not yet implemented since it isn't needed until proven necessary.
+  num_workers: 4
+  amp: auto  # mixed precision -- close to a requirement at this resolution on a T4's 16GB
+  checkpoint_out: outputs/checkpoints/finetune_resnet50_kaggle.pt
+  log_csv: outputs/logs/finetune_log_kaggle.csv
+
+env:
+  NCCL_P2P_DISABLE: 1  # defensive, unchanged from jp-mvp1 -- Kaggle's virtualized
+                       # dual-GPU instances are widely reported to hang on NCCL's
+                       # default peer-to-peer transport
+  nccl_device_id_fix: >-
+    Unchanged from jp-mvp1 -- src/distributed.py already passes device_id explicitly
+    to init_process_group(). See jp-mvp1's README for the original one-GPU-idle-at-0%
+    writeup; not re-derived here.
+
+model_selection:
+  criterion: val_pq_mean  # checkpointed automatically by src/train.py each epoch
+
+ablation:
+  # RESNET_PRETRAIN_PLAN.md section 10's actual deliverable -- falls out of this
+  # pipeline for free by re-running section 4 of the notebook with the encoder
+  # varied, everything else held fixed:
+  - "resnet50 + BYOL checkpoint (this config)"
+  - "resnet50 + plain ImageNet weights (--encoder-checkpoint omitted)"
+  - "resnet18 + plain ImageNet weights (jp-mvp1's own baseline recipe, val PQ=0.3071 at img_size=1024 -- rerun at img_size=2048 for a same-resolution comparison)"
+
+submission:
+  out: outputs/submissions/finetune_resnet50_kaggle.csv
+  stage_for_kaggle_submit: /kaggle/working/submission.csv  # Kaggle's "Submit to competition from notebook" convention
+
+repo:
+  clone_url: https://github.com/jprakash-1/Solar-Filament-Segmentation.git
+  branch: jp-finetune-resnet50  # must be pushed to origin before the notebook's
+                                # `git clone -b jp-finetune-resnet50` step will work

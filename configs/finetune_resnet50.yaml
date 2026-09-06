@@ -1,0 +1,70 @@
+# Stage 4 fine-tuning settings record. Documentation of the defaults baked into
+# src/train.py's argparse -- not live-loaded by any script, same convention as
+# configs/mvp1.yaml. See FINETUNE_PLAN.md for the design and the decisions behind
+# these choices; this file only records the resulting numbers.
+
+data:
+  data_json: data/raw/MAGFiLO_1.0_Kaggle_2026/train/MAGFiLO_1.0_Annotations_kaggle2026_train.json
+  train_images_dir: data/raw/MAGFiLO_1.0_Kaggle_2026/train/train_images
+  test_images_dir: data/raw/MAGFiLO_1.0_Kaggle_2026/test/test_images
+  val_fraction: 0.15
+  split_group_key: file_name  # never image_id -- see src/dataset.py docstring
+  seed: 0
+
+model:
+  architecture: smp.Unet  # unchanged from jp-mvp1 -- semantic mask + connected-components
+                          # postprocessing, per this session's explicit decision not to
+                          # build a new instance head (CondInst/embedding/Mask2Former)
+                          # ahead of PRETRAIN_PLAN.md section 5.1's still-pending
+                          # error-analysis measurement
+  encoder: resnet50  # domain-pretrained via BYOL on GONG Halpha, see
+                     # RESNET_PRETRAIN_PLAN.md; jp-mvp1 default was resnet18/imagenet
+  encoder_checkpoint: <export_encoder.py output -- see scripts/verify_encoder_checkpoint.py>
+  in_channels: 1
+  classes: 1
+  img_size: 2048  # native resolution, no downsampling -- explicit project direction,
+                  # NOT the 224px the encoder was BYOL-pretrained at, nor the 1024px
+                  # jp-mvp1's one real Kaggle run used (val PQ=0.3071, see
+                  # jp-mvp1:mvp1-solar.ipynb). See FINETUNE_PLAN.md for the accepted
+                  # BatchNorm-calibration tradeoff this implies.
+
+train:
+  loss: tversky_bce  # 0.5*BCE + Tversky(alpha=0.3, beta=0.7), PRETRAIN_PLAN.md section
+                     # 5.4 -- recall-biased for thin filament structures. jp-mvp1's
+                     # original bce_dice loss is still available via --loss bce_dice.
+  optimizer: adamw
+  weight_decay: 1.0e-4
+  head_lr: 1.0e-3       # decoder + segmentation head
+  encoder_lr_decay: 0.75  # per-stage decay from decoder back to the stem, section 5.5
+  freeze_epochs: 3      # encoder frozen for these first epochs, section 5.6
+  epochs: 30
+  batch_size: 8  # local Mac default -- see configs/finetune_resnet50_kaggle.yaml for
+                 # why this needs to shrink drastically on a real GPU at img_size=2048
+  num_workers: 0
+  amp: auto  # CUDA only in practice -- no-op on local CPU/MPS runs
+
+augmentation:
+  # Joint image+mask (albumentations), all label-preserving -- no canonical "up" on
+  # the Sun, per PRETRAIN_PLAN.md section 5.6 -- applied to the train split only.
+  - RandomRotate90 (p=0.75)
+  - HorizontalFlip / VerticalFlip (p=0.5 each)
+  - RandomGamma (p=0.5)
+  - RandomBrightnessContrast (p=0.5)
+  - GaussNoise (p=0.3)
+  - CoarseDropout (p=0.3)
+
+model_selection:
+  criterion: val_pq_mean  # NOT val_dice (jp-mvp1's criterion) -- Dice/BCE convergence
+                          # doesn't guarantee good instance separation, section 5.6
+  linear_probe_tripwire: >-
+    Run once with --linear-probe-only (freezes the encoder for the entire run) to
+    record a frozen-encoder val PQ baseline before trusting the full fine-tune's
+    result -- if the full fine-tune ends up below this number, that's a direct
+    forgetting signal, not noise. Manual comparison, not automated.
+
+postprocess:
+  prob_thresh: 0.5
+  min_area_px: 15
+  discipline: >-
+    upsample probability map to native 2048x2048 BEFORE thresholding, then connected
+    components -- unchanged from jp-mvp1. At img_size=2048 this resize is a no-op.

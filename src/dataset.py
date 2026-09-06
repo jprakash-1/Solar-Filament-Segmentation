@@ -45,11 +45,23 @@ class FilamentDataset(Dataset):
     test set will contain filament-free frames.
     """
 
-    def __init__(self, coco_json: str | Path, img_dir: str | Path, image_ids: list[str], img_size: int = 256):
+    def __init__(
+        self,
+        coco_json: str | Path,
+        img_dir: str | Path,
+        image_ids: list[str],
+        img_size: int = 256,
+        transform=None,
+    ):
         self.coco = COCO(str(coco_json))
         self.img_dir = Path(img_dir)
         self.ids = image_ids
         self.img_size = img_size
+        # Optional albumentations.Compose (image+mask jointly, e.g. rotation/flip/
+        # gamma/noise) -- caller's responsibility to pass one only for the train
+        # split; kept as a plain hook here rather than a train/val bool so this
+        # dataset stays agnostic to any particular augmentation recipe.
+        self.transform = transform
 
     def __len__(self) -> int:
         return len(self.ids)
@@ -72,6 +84,10 @@ class FilamentDataset(Dataset):
 
         img_rs = cv2.resize(img, (self.img_size, self.img_size), interpolation=cv2.INTER_AREA)
         mask_rs = cv2.resize(semantic_mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
+
+        if self.transform is not None:
+            augmented = self.transform(image=img_rs, mask=mask_rs)
+            img_rs, mask_rs = augmented["image"], augmented["mask"]
 
         img_t = torch.from_numpy(img_rs).float().unsqueeze(0) / 255.0
         mask_t = torch.from_numpy(mask_rs).float().unsqueeze(0)

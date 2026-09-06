@@ -1,8 +1,19 @@
-# Solar Filament Segmentation Challenge 2026 — MVP1
+# Solar Filament Segmentation Challenge 2026 — MVP1 + Stage 4 fine-tuning
 
 Kaggle competition: [Solar Filament Segmentation Challenge 2026](https://www.kaggle.com/competitions/filament-segmentation-2026)
 Task: class-agnostic instance segmentation of solar filaments in GONG H-Alpha
 full-disk imagery (2048×2048, 8-bit grayscale).
+
+This branch (`jp-finetune-resnet50`, forked from `jp-mvp1`) is Stage 4 of
+`PRETRAIN_PLAN.md` / `RESNET_PRETRAIN_PLAN.md`: fine-tuning the GONG Hα
+BYOL-pretrained ResNet50 encoder (built on `jp-pretraining-data-prep`) on this
+same MVP1 pipeline, instead of a plain ImageNet-init `resnet18`. The
+segmentation head (`smp.Unet` + connected-components postprocessing) is
+unchanged from MVP1 by explicit decision — only the encoder and the
+fine-tuning recipe are new. See `FINETUNE_PLAN.md` for the full design,
+including the checkpoint-loading landmine it avoids and what's been verified
+so far. Everything below this point is MVP1's own original README, still
+accurate for the pipeline this branch extends.
 
 ## MVP1 goal
 
@@ -21,10 +32,14 @@ raw JPEG + COCO JSON -> Dataset/DataLoader -> tiny/fast model -> raw prediction
 configs/
   mvp1.yaml                # local settings record (documentation, not live-loaded)
   mvp1_kaggle.yaml           # Kaggle GPU settings record (bigger batch/epochs, same architecture)
+  finetune_resnet50.yaml         # Stage 4 local settings record
+  finetune_resnet50_kaggle.yaml   # Stage 4 Kaggle GPU settings record (img_size=2048, AMP, batch size caveat)
 src/
-  dataset.py             # COCO parsing, group-aware split, FilamentDataset
-  model.py                # tiny U-Net (segmentation_models_pytorch)
-  train.py                 # training loop (python -m src.train, or torchrun for multi-GPU)
+  dataset.py             # COCO parsing, group-aware split, FilamentDataset (+ optional augment transform)
+  model.py                # U-Net (segmentation_models_pytorch); build_model(encoder_checkpoint=...) loads a
+                           # domain-pretrained encoder -- see its module docstring for the loading discipline
+  train.py                 # training loop (python -m src.train, or torchrun for multi-GPU); Stage 4's
+                           # loss/layer-wise-LR/freeze-warmup/AMP/val-PQ-selection additions live here
   distributed.py            # minimal DDP helpers (is_distributed/setup/cleanup), unused unless launched via torchrun
   infer.py                  # U-Net inference -> instances -> submission (python -m src.infer)
   postprocess.py             # prob map -> per-instance masks (upsample-then-threshold-then-CC)
@@ -33,12 +48,16 @@ src/
   metrics.py                    # local Dice + Panoptic Quality
 scripts/
   baseline_classical.py    # zero-training CV baseline (Option A)
+  verify_encoder_checkpoint.py  # Stage 4: sanity-check a BYOL encoder checkpoint before fine-tuning on it
 notebooks/
   00_eda.ipynb              # Step-0 sanity check -- run before trusting anything else
 outputs/
   checkpoints/, logs/, submissions/   # gitignored except .gitkeep
 train_mvp1_kaggle.ipynb   # repo root, not notebooks/ -- this is the file you upload to Kaggle directly.
                           # Clones this repo + runs src/train.py & src/infer.py on a Kaggle GPU.
+finetune_resnet50_kaggle.ipynb   # Stage 4 counterpart -- same pattern, adds the encoder-checkpoint dataset
+                                # auto-detection and the fine-tuning-specific CLI flags.
+FINETUNE_PLAN.md          # Stage 4 design doc -- read this before touching src/train.py's fine-tuning flags
 ```
 
 ## Quickstart
@@ -75,6 +94,29 @@ the notebook's `git clone -b jp-mvp1 ...` step will fail otherwise. Upload it to
 Kaggle, edit/attach the competition dataset there, then run; it has not been
 executed in this environment (no `/kaggle/input` mount or GPU available locally to
 test against).
+
+## Stage 4: fine-tuning the domain-pretrained ResNet50
+
+`src/train.py` and `src/infer.py` above are shared with this — the fine-tuning
+path is additional flags, not a separate script:
+
+```bash
+# verify a BYOL-exported encoder checkpoint loads cleanly before spending GPU time on it
+python scripts/verify_encoder_checkpoint.py --checkpoint path/to/resnet50_byol_encoder.pt
+
+python -m src.train \
+    --encoder-name resnet50 --encoder-checkpoint path/to/resnet50_byol_encoder.pt \
+    --img-size 2048 --loss tversky_bce --freeze-epochs 3
+
+# forgetting-tripwire baseline (PRETRAIN_PLAN.md section 5.6) -- run once, compare its
+# best val PQ against the full fine-tune's
+python -m src.train --linear-probe-only --encoder-name resnet50 --encoder-checkpoint <ckpt>
+```
+
+`src/infer.py` needs no new flags — it reads `encoder_name` back out of whichever
+checkpoint it's given. See `FINETUNE_PLAN.md` for what each new flag does and why,
+and `finetune_resnet50_kaggle.ipynb` / `configs/finetune_resnet50_kaggle.yaml` for
+the real (GPU-scale) run.
 
 ## Definition of done for MVP1
 

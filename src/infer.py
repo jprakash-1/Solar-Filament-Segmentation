@@ -75,7 +75,13 @@ def predict_prob_map(model: torch.nn.Module, gray: np.ndarray, img_size: int, de
 
 def load_model(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]:
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model = build_model().to(device)
+    # encoder_name defaults to "resnet18" for older jp-mvp1 checkpoints saved
+    # before src/train.py started persisting it. encoder_weights=None regardless
+    # of architecture -- load_state_dict below overwrites every encoder weight
+    # anyway, so there's no reason to fetch ImageNet weights just to discard them
+    # (same reasoning as export_encoder.py on the pretraining branch).
+    encoder_name = ckpt.get("encoder_name", "resnet18")
+    model = build_model(encoder_name=encoder_name, encoder_weights=None).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     return model, ckpt
