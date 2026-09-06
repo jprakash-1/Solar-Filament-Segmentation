@@ -347,7 +347,24 @@ def main() -> None:
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     if distributed:
-        model = DDP(model, device_ids=[local_rank])
+        # find_unused_parameters=True is required whenever a freeze/unfreeze
+        # schedule can run (fine_tuning=True): DDP is constructed here, while
+        # every parameter still has requires_grad=True (the freeze toggle only
+        # happens later, per-epoch, inside the loop below). Once
+        # set_encoder_requires_grad(..., False) runs for the frozen epochs, the
+        # encoder's parameters stop producing gradients entirely -- but DDP's
+        # default (find_unused_parameters=False) assumes every parameter it saw
+        # at construction time will receive one on every backward call, and
+        # raises ("Expected to have finished reduction... Parameter indices
+        # which did not receive grad...") the moment that assumption breaks.
+        # Confirmed directly: this crashed on real Kaggle T4 x2 hardware on the
+        # very first training step of epoch 1 (freeze_epochs=3 by default), with
+        # every encoder parameter listed as unused. find_unused_parameters=True
+        # makes DDP tolerate a param not getting a gradient in a given
+        # iteration (a small per-iteration traversal cost) instead of asserting
+        # the set of trainable parameters never changes -- exactly this branch's
+        # use case, so only pay for it here, not on a plain (non-fine-tuning) run.
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=fine_tuning)
 
     best_val_pq = -1.0
     if is_main:
