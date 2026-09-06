@@ -59,8 +59,21 @@ train:
   early_stopping_patience: 5  # stop if val PQ hasn't improved in 5 epochs -- 0 disables
   num_workers: 4
   amp: auto  # mixed precision -- close to a requirement at this resolution on a T4's 16GB
-  checkpoint_out: outputs/checkpoints/finetune_resnet50_kaggle.pt
+  checkpoint_out: outputs/checkpoints/finetune_resnet50_kaggle.pt  # best-val-PQ, inference-ready
+  latest_checkpoint_out: outputs/checkpoints/finetune_resnet50_latest.pt  # every epoch, resumable
   log_csv: outputs/logs/finetune_log_kaggle.csv
+
+resume:
+  # epochs: is the TOTAL across all sessions, not per-session -- a resumed run
+  # trains only the epochs remaining, same convention RESNET_PRETRAIN_PLAN.md's
+  # BYOL pretraining already uses. finetune_resnet50_kaggle.ipynb section 3.5
+  # auto-detects a mounted finetune_resnet50_latest.pt and passes --resume;
+  # nothing to configure manually beyond attaching that Dataset as an input.
+  session_checklist: >-
+    1) mount the competition data + encoder checkpoint + (if any) prior session's
+    finetune_resnet50_latest.pt Dataset; 2) run the notebook unchanged; 3) version
+    outputs/checkpoints/ as a new Dataset when the session ends before --epochs
+    completes; 4) repeat, attaching that new version next time.
 
 env:
   NCCL_P2P_DISABLE: 1  # defensive, unchanged from jp-mvp1 -- Kaggle's virtualized

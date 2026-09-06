@@ -89,7 +89,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-fraction", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None, help="cuda / mps / cpu -- auto-detected if omitted")
-    p.add_argument("--checkpoint-out", type=Path, default=Path("outputs/checkpoints/finetune_resnet50.pt"))
+    p.add_argument("--checkpoint-out", type=Path, default=Path("outputs/checkpoints/finetune_resnet50.pt"), help="best-val-PQ checkpoint, inference-ready (model weights + metadata only) -- what src/infer.py expects")
+    p.add_argument("--latest-checkpoint-out", type=Path, default=Path("outputs/checkpoints/finetune_resnet50_latest.pt"), help="saved unconditionally every epoch (model+optimizer+scaler+schedule state) so a killed/interrupted run can resume -- see --resume")
+    p.add_argument("--resume", type=Path, default=None, help="path to a --latest-checkpoint-out checkpoint to resume from -- restores model/optimizer/scaler/epoch/best-val-PQ/early-stopping state and continues toward the same --epochs total (mirrors the multi-session Kaggle pattern RESNET_PRETRAIN_PLAN.md already uses for BYOL pretraining)")
     p.add_argument("--log-csv", type=Path, default=Path("outputs/logs/finetune_log.csv"), help="per-epoch train/val loss+dice+PQ, overwritten each run")
 
     # Encoder / architecture
@@ -381,6 +383,33 @@ def main() -> None:
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    start_epoch = 1
+    best_val_pq = -1.0
+    epochs_since_improvement = 0
+    if args.resume is not None:
+        # Every rank reads the same static file independently -- unlike the
+        # ImageNet-weights-download race above, this is a read of an
+        # already-complete local file, so there's no concurrent-write hazard
+        # requiring a barrier here.
+        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        if is_main and (resume_ckpt.get("encoder_name") != args.encoder_name or resume_ckpt.get("img_size") != args.img_size):
+            print(
+                f"  WARNING: --resume checkpoint was trained with encoder_name={resume_ckpt.get('encoder_name')} "
+                f"img_size={resume_ckpt.get('img_size')}, but this run passed encoder_name={args.encoder_name} "
+                f"img_size={args.img_size} -- make sure that's intentional (kaggle.md: naive resume that silently "
+                f"changes the setup is exactly the kind of thing to catch by checking, not assuming)."
+            )
+        model.load_state_dict(resume_ckpt["model_state_dict"])
+        optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+        if scaler is not None and resume_ckpt.get("scaler_state_dict") is not None:
+            scaler.load_state_dict(resume_ckpt["scaler_state_dict"])
+        start_epoch = resume_ckpt["epoch"] + 1
+        best_val_pq = resume_ckpt["best_val_pq"]
+        epochs_since_improvement = resume_ckpt["epochs_since_improvement"]
+        if is_main:
+            print(f"Resumed from {args.resume}: continuing at epoch {start_epoch}/{args.epochs} "
+                  f"(best_val_pq so far={best_val_pq:.4f}, epochs_since_improvement={epochs_since_improvement})")
+
     if distributed:
         # find_unused_parameters=True is required whenever a freeze/unfreeze
         # schedule can run (fine_tuning=True): DDP is constructed here, while
@@ -401,16 +430,24 @@ def main() -> None:
         # use case, so only pay for it here, not on a plain (non-fine-tuning) run.
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=fine_tuning)
 
-    best_val_pq = -1.0
-    epochs_since_improvement = 0
     early_stop_signal = torch.zeros(1, device=device) if distributed else None
     if is_main:
         args.checkpoint_out.parent.mkdir(parents=True, exist_ok=True)
+        args.latest_checkpoint_out.parent.mkdir(parents=True, exist_ok=True)
         args.log_csv.parent.mkdir(parents=True, exist_ok=True)
+        # "w" (not "a") even on resume -- a fresh header plus fresh rows is
+        # simpler than reconciling with a partial prior CSV, and the checkpoints
+        # (not this CSV) are what resuming actually depends on. A resumed run's
+        # log therefore only covers epochs from start_epoch onward, not the full
+        # history -- acceptable since outputs/logs is meant for the current
+        # session's curve, not a permanent record.
         with open(args.log_csv, "w", newline="") as f:
             csv.writer(f).writerow(["epoch", "train_loss", "train_dice", "val_loss", "val_dice", "val_pq_mean", "val_pq_pooled", "encoder_frozen"])
 
-    epoch_range = range(1, args.epochs + 1)
+    if is_main and start_epoch > args.epochs:
+        print(f"--resume checkpoint is already at epoch {start_epoch - 1} >= --epochs {args.epochs} -- nothing to do.")
+
+    epoch_range = range(start_epoch, args.epochs + 1)
     for epoch in (tqdm(epoch_range, desc="epochs") if is_main else epoch_range):
         plain_model = model.module if distributed else model
         encoder_frozen = fine_tuning and epoch <= freeze_epochs
@@ -441,9 +478,39 @@ def main() -> None:
             with open(args.log_csv, "a", newline="") as f:
                 csv.writer(f).writerow([epoch, train_loss, train_dice, val_loss, val_dice, val_pq["mean_per_image_pq"], val_pq["pooled_pq"], encoder_frozen])
 
-            if val_pq["mean_per_image_pq"] > best_val_pq:
+            improved = val_pq["mean_per_image_pq"] > best_val_pq
+            if improved:
                 best_val_pq = val_pq["mean_per_image_pq"]
                 epochs_since_improvement = 0
+            else:
+                epochs_since_improvement += 1
+
+            # Unconditional every-epoch checkpoint (model + optimizer + scaler +
+            # schedule state) so a killed/interrupted run can resume via
+            # --resume without losing more than one epoch -- same discipline
+            # PRETRAIN_PLAN.md's BYOL pretraining already uses for its own
+            # multi-session Kaggle runs. Deliberately separate from the "best"
+            # checkpoint below: src/infer.py only ever needs model weights +
+            # inference metadata, and shouldn't have to skip past optimizer
+            # state it doesn't use.
+            torch.save(
+                {
+                    "model_state_dict": plain_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+                    "epoch": epoch,
+                    "best_val_pq": best_val_pq,
+                    "epochs_since_improvement": epochs_since_improvement,
+                    "img_size": args.img_size,
+                    "encoder_name": args.encoder_name,
+                    "val_fraction": args.val_fraction,
+                    "seed": args.seed,
+                    "loss": args.loss,
+                },
+                args.latest_checkpoint_out,
+            )
+
+            if improved:
                 torch.save(
                     {
                         "model_state_dict": plain_model.state_dict(),
@@ -459,11 +526,9 @@ def main() -> None:
                     args.checkpoint_out,
                 )
                 print(f"  -> saved new best checkpoint (val_pq={best_val_pq:.4f}) to {args.checkpoint_out}")
-            else:
-                epochs_since_improvement += 1
-                if args.early_stopping_patience > 0 and epochs_since_improvement >= args.early_stopping_patience:
-                    print(f"Early stopping: val PQ hasn't improved for {epochs_since_improvement} epochs (patience={args.early_stopping_patience}, best={best_val_pq:.4f})")
-                    should_stop = True
+            elif args.early_stopping_patience > 0 and epochs_since_improvement >= args.early_stopping_patience:
+                print(f"Early stopping: val PQ hasn't improved for {epochs_since_improvement} epochs (patience={args.early_stopping_patience}, best={best_val_pq:.4f})")
+                should_stop = True
 
         if distributed:
             dist.barrier()  # don't let other ranks start the next epoch until rank 0's validation/checkpoint is done

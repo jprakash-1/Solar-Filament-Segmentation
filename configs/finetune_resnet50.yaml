@@ -48,6 +48,19 @@ train:
   num_workers: 0
   amp: auto  # CUDA only in practice -- no-op on local CPU/MPS runs
 
+checkpointing:
+  checkpoint_out: outputs/checkpoints/finetune_resnet50.pt  # best-val-PQ only,
+                                                             # what src/infer.py expects
+  latest_checkpoint_out: outputs/checkpoints/finetune_resnet50_latest.pt  # every
+                                                             # epoch, unconditionally
+                                                             # (model+optimizer+scaler+
+                                                             # schedule state)
+  resume: >-
+    pass --resume <path to a latest_checkpoint_out file> to continue a killed/
+    interrupted run -- --epochs is the TOTAL across the original run and the
+    resume, not additional epochs on top. See configs/finetune_resnet50_kaggle.yaml
+    for the multi-session Kaggle workflow this exists for.
+
 augmentation:
   # Joint image+mask (albumentations), all label-preserving -- no canonical "up" on
   # the Sun, per PRETRAIN_PLAN.md section 5.6 -- applied to the train split only.

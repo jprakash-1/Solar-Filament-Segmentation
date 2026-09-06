@@ -151,6 +151,20 @@ catches the exact class of bug §11 already found once for the ImageNet stem pat
     freeze-warmup fix and that `PRETRAIN_PLAN.md`'s `train_ddp.py` sketch flags
     for wall-clock-based stopping; letting rank 0 break out alone would hang
     every other rank at its next collective op.
+  - Checkpointing split into two files, matching the multi-session Kaggle
+    pattern `RESNET_PRETRAIN_PLAN.md`'s BYOL pretraining already uses:
+    `--checkpoint-out` (unchanged format — best val PQ only, model weights +
+    inference metadata, what `src/infer.py` expects) and a new
+    `--latest-checkpoint-out`, saved **unconditionally every epoch** with
+    model + optimizer + scaler + `epoch`/`best_val_pq`/`epochs_since_improvement`
+    — everything needed to resume exactly. `--resume <latest checkpoint>`
+    restores all of it and continues from `epoch+1` toward the *same*
+    `--epochs` total (not `--epochs` additional epochs) — mirrors
+    `PRETRAIN_PLAN.md` §4.3's "TOTAL_EPOCHS planned across ALL sessions, not
+    per-session" convention. `finetune_resnet50_kaggle.ipynb` §3.5
+    auto-detects a mounted `finetune_resnet50_latest.pt` from a prior session
+    and passes `--resume` automatically; absent on a first session, same
+    auto-detect-or-fall-back pattern the encoder-checkpoint cell already uses.
 - **`src/infer.py`**: `load_model()` reads `encoder_name` back out of the
   checkpoint (defaults to `"resnet18"` for older `jp-mvp1` checkpoints saved
   before this field existed) and builds with `encoder_weights=None` (every
@@ -181,6 +195,13 @@ catches the exact class of bug §11 already found once for the ImageNet stem pat
   epochs. `--early-stopping-patience` verified to stop training at the correct
   epoch (patience=1 with a frozen/non-improving run stopped after 2 epochs of a
   10-epoch budget, logging why).
+- `--resume` verified end-to-end: trained epochs 1–2, inspected the saved
+  `finetune_resnet50_latest.pt` (confirmed it carries `optimizer_state_dict`,
+  `epoch=2`, `best_val_pq`, `epochs_since_improvement`), then resumed with
+  `--epochs 4` and confirmed it correctly continued at "epoch 3/4" rather than
+  restarting. Also checked the already-complete edge case (`--resume` a
+  checkpoint whose `epoch` already meets `--epochs`) exits cleanly with a
+  message instead of crashing or looping.
 - **A second bug found while re-testing the notebook after these additions**:
   `finetune_resnet50_kaggle.ipynb`'s dependency-install cell had `\\b` (two
   literal backslashes) instead of `\b` (a regex word boundary) in its
