@@ -88,3 +88,26 @@ postprocess:
   discipline: >-
     upsample probability map to native 2048x2048 BEFORE thresholding, then connected
     components -- unchanged from jp-mvp1. At img_size=2048 this resize is a no-op.
+
+stage1_crop_training:
+  # jp-analysis:memory.md's agreed two-stage curriculum, Stage 1 -- capability
+  # exists (opt-in via --crop-size), NOT wired into the live Kaggle training
+  # command yet; that's a separate, deliberate follow-up decision. See
+  # FINETUNE_PLAN.md section 5 for the full design and what's been verified.
+  enable: --crop-size 512  # unset (None) reproduces today's whole-image-only
+                           # behavior exactly -- val/inference are unaffected
+                           # either way, always whole-image
+  fused_data_json: data/processed/MAGFiLO_fused_train.json  # scripts/fuse_duplicate_annotations.py
+                                                             # output -- build this first
+  crops_per_image: 4
+  bg_crop_fraction: 0.2
+  duplicate_fusion:
+    near_zero_iou_threshold: 0.1  # below this: union (annotators marked disjoint filaments)
+    match_iou_threshold: 0.3      # above this: matched, majority-vote-fused (2-way
+                                   # degrades to intersection, not union -- deliberate,
+                                   # see FINETUNE_PLAN.md)
+  note: >-
+    persistent_workers is forced off for the train loader specifically when
+    --crop-size is set (src/train.py) -- FilamentCropDataset.set_epoch() (varies
+    crop sampling across epochs) doesn't reach already-forked persistent workers,
+    confirmed directly. The whole-image path is unaffected.

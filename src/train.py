@@ -59,6 +59,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from src.crop_dataset import FilamentCropDataset
 from src.dataset import FilamentDataset, group_split
 from src.distributed import cleanup_distributed, is_distributed, setup_distributed
 from src.metrics import aggregate_pq, dice_score, panoptic_quality
@@ -82,7 +83,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("data/raw/MAGFiLO_1.0_Kaggle_2026/train/train_images"),
     )
-    p.add_argument("--img-size", type=int, default=2048, help="native resolution by default -- no downsampling (see module docstring)")
+    p.add_argument("--img-size", type=int, default=2048, help="native resolution by default -- no downsampling (see module docstring); ignored for the train split when --crop-size is set (val/inference always use this)")
+    p.add_argument("--crop-size", type=int, default=None, help="Stage 1 crop-based training (jp-analysis:memory.md's agreed two-stage curriculum) -- when set, the TRAIN split samples foreground-biased crops of this size via src.crop_dataset.FilamentCropDataset instead of whole --img-size images. Val/inference are unaffected (always whole-image, unchanged) -- omit to reproduce today's whole-image-only behavior exactly.")
+    p.add_argument("--fused-data-json", type=Path, default=Path("data/processed/MAGFiLO_fused_train.json"), help="scripts/fuse_duplicate_annotations.py output -- only read when --crop-size is set; the train split's duplicate-annotator groups are pre-fused into one consensus instance set per image before cropping, so crop-centering never has to arbitrate between two disagreeing whole-image annotator versions. Val stays on --data-json (raw, unfused) always -- val PQ must reflect real annotation data, not this script's own fusion heuristic.")
+    p.add_argument("--crops-per-image", type=int, default=4, help="only used with --crop-size -- how many crop samples each source image contributes per epoch")
+    p.add_argument("--bg-crop-fraction", type=float, default=0.2, help="only used with --crop-size -- fraction of crops that are uniform-random (background-biased) rather than centered on a random instance")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=8, help="per-process under DDP; re-tune empirically at img-size=2048, 8 is almost certainly too large on a 16GB GPU")
     p.add_argument("--grad-accum-steps", type=int, default=1, help="accumulate gradients over this many micro-batches before each optimizer step -- simulates a larger effective batch size at the same peak memory as --batch-size; 1 disables accumulation (unchanged behavior)")
@@ -347,13 +352,41 @@ def main() -> None:
         print(f"train: {len(train_ids)} images, val: {len(val_ids)} images (grouped by file_name)")
 
     train_transform = build_train_transform()
-    train_ds = FilamentDataset(args.data_json, args.images_dir, train_ids, img_size=args.img_size, transform=train_transform)
+    if args.crop_size:
+        # Same file_name-grouped split as always -- just re-expressed as file_names
+        # (the fused json's image_id) instead of raw image_ids, since the fused
+        # json collapses each duplicate group's several raw image_ids down to one
+        # entry keyed by file_name. No leakage risk: train_ids/val_ids already
+        # never split a file_name's annotator versions across sides.
+        train_file_names = sorted({full_ds.coco.imgs[iid]["file_name"] for iid in train_ids})
+        train_ds = FilamentCropDataset(
+            args.fused_data_json, args.images_dir, train_file_names,
+            crop_size=args.crop_size, crops_per_image=args.crops_per_image,
+            bg_crop_fraction=args.bg_crop_fraction, transform=train_transform, seed=args.seed,
+        )
+        if is_main:
+            print(f"Stage 1 crop training: crop_size={args.crop_size} crops_per_image={args.crops_per_image} "
+                  f"bg_crop_fraction={args.bg_crop_fraction} fused_data_json={args.fused_data_json}")
+    else:
+        train_ds = FilamentDataset(args.data_json, args.images_dir, train_ids, img_size=args.img_size, transform=train_transform)
+    # Val/inference always whole-image, always the raw (unfused) --data-json --
+    # val PQ must reflect real annotation data, not this run's own fusion
+    # heuristic, regardless of whether train is crop-based this run or not.
     val_ds = FilamentDataset(args.data_json, args.images_dir, val_ids, img_size=args.img_size)
 
     pin_memory = device.type == "cuda"
     loader_kwargs = {"num_workers": args.num_workers, "pin_memory": pin_memory}
     if args.num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
+        # NOT persistent_workers when crop_size is set: FilamentCropDataset.set_epoch()
+        # mutates the main-process dataset object, but persistent workers are forked
+        # ONCE and keep their own copy for the DataLoader's whole lifetime -- the
+        # main process's update never reaches them. Confirmed directly (a real bug
+        # caught before it shipped, not a hypothetical): with persistent_workers=True,
+        # every epoch produced byte-identical crops; with it off, workers respawn
+        # fresh each epoch from the just-updated dataset and correctly vary. Costs a
+        # small per-epoch worker-respawn latency -- the whole-image FilamentDataset
+        # path has no such requirement, so it's unaffected (still persistent).
+        loader_kwargs["persistent_workers"] = not args.crop_size
 
     if distributed:
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
@@ -483,6 +516,8 @@ def main() -> None:
 
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+        if hasattr(train_ds, "set_epoch"):  # FilamentCropDataset only -- see its set_epoch docstring for why this matters (deterministic-per-(epoch,idx) crop sampling, not shared mutable RNG state across DataLoader workers)
+            train_ds.set_epoch(epoch)
         train_loss, train_dice = run_train_epoch(model, train_loader, device, optimizer, loss_fn, scaler, use_amp, args.grad_accum_steps, distributed)
 
         if distributed:

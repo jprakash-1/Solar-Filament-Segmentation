@@ -305,3 +305,66 @@ catches the exact class of bug §11 already found once for the ImageNet stem pat
       breakdown) is still not done — this fine-tune is explicitly "the ResNet
       baseline with the *current* head," not a claim that semantic-mask+CC is
       the final architecture.
+
+---
+
+## 5. Stage 1: crop-based training + duplicate-annotation fusion
+
+Implements `jp-analysis:memory.md`'s "Training-strategy discussion" entry
+(agreed direction, not built there) — see that entry for the full rationale.
+Two new pieces, both additive (the whole-image path is completely unchanged
+and is still what `finetune_resnet50_kaggle.ipynb`'s live training command
+actually uses; this section documents the *capability*, not a switch-over):
+
+- **`scripts/fuse_duplicate_annotations.py`**: routes each of the 296
+  duplicate-annotator groups to either a union (near-zero-IoU groups, mean
+  pairwise IoU < 0.1) or a per-instance-matched majority-vote fusion (the
+  rest) — never a flat whole-image mask union, which `memory.md` explicitly
+  warns would weld nearby distinct filaments into one blob. Reuses
+  `src/metrics._iou_matrix` (imported, not reimplemented) for the matching
+  step; doesn't touch `src/metrics.py` itself, which sits on the live
+  training critical path. Output is a new COCO json,
+  `data/processed/MAGFiLO_fused_train.json`, plug-compatible with every
+  existing consumer.
+- **`src/crop_dataset.FilamentCropDataset`**: Stage 1's foreground-biased
+  crop sampler (new module, `src/dataset.py`/`FilamentDataset` untouched).
+  `src/train.py` gains `--crop-size` (train split only; val/inference stay
+  whole-image on the raw, unfused `--data-json` always — val PQ must reflect
+  real annotation data, not this script's own fusion heuristic), plus
+  `--fused-data-json`, `--crops-per-image`, `--bg-crop-fraction`.
+
+**A real, non-obvious bug found and fixed while verifying this**: with
+`persistent_workers=True` (the existing default for `--num-workers > 0`),
+`FilamentCropDataset.set_epoch()` — called once per epoch so crop sampling
+varies across epochs, mirroring `DistributedSampler.set_epoch()` — silently
+did nothing. Persistent workers are forked *once* and keep their own copy of
+the dataset object for the DataLoader's whole lifetime; the main process
+mutating `train_ds._epoch` afterward never reaches them. Confirmed directly
+(not assumed): with persistent workers, three consecutive epochs produced
+byte-identical crops; without them, they correctly varied. Fixed by setting
+`persistent_workers=False` specifically when `--crop-size` is set (the
+whole-image path is unaffected, still persistent) — costs a small per-epoch
+worker-respawn latency, the only correct fix available (there is no
+supported "push an update to already-forked persistent workers" API).
+
+**Verified**: the fusion algorithm against a hand-constructed synthetic
+dataset covering all four routing cases (single-annotator pass-through,
+near-zero-IoU union, 2-annotator matched fusion, 3-annotator matched
+fusion) — every fused bbox/area checked against an independently computed
+expected result (not just "did it run"), including confirming the 2-way
+case genuinely degrades to intersection (not union) as documented.
+`cv2.fillPoly`'s out-of-canvas clipping behavior (crop-mask rasterization
+depends on it) checked directly rather than assumed. `FilamentCropDataset`
+verified standalone (shapes, a crop centered on one instance correctly
+still captures a nearby second instance in its mask rather than masking it
+out, small-image padding, real multi-worker `DataLoader` across epochs) and
+through a full `src/train.py` round trip (fusion script → crop training →
+checkpoint, with val staying whole-image throughout). The existing
+whole-image path re-verified unaffected after these changes.
+
+**Not done**: `--crop-size` is not wired into `finetune_resnet50_kaggle.ipynb`'s
+actual training command — that's a deliberate follow-up decision, not an
+oversight, since switching the live Kaggle recipe over is a separate call
+from having the capability exist and work. Real-data verification of the
+fusion script (real MAGFiLO annotations, not synthetic) — same situation as
+everything else on this branch, the data isn't present locally.
