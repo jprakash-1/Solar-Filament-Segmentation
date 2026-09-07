@@ -362,9 +362,21 @@ through a full `src/train.py` round trip (fusion script → crop training →
 checkpoint, with val staying whole-image throughout). The existing
 whole-image path re-verified unaffected after these changes.
 
-**Not done**: `--crop-size` is not wired into `finetune_resnet50_kaggle.ipynb`'s
-actual training command — that's a deliberate follow-up decision, not an
-oversight, since switching the live Kaggle recipe over is a separate call
-from having the capability exist and work. Real-data verification of the
-fusion script (real MAGFiLO annotations, not synthetic) — same situation as
-everything else on this branch, the data isn't present locally.
+**Now wired into `finetune_resnet50_kaggle.ipynb`** as a new, separate,
+optional §3.7 ("Stage 1 (optional): duplicate-annotation fusion +
+crop-based training") — **added alongside** §4's whole-image training, not
+in place of it: its own fusion-output path (`outputs/data/MAGFiLO_fused_train.json`,
+under the writable `/kaggle/working`, not the read-only mounted input dir)
+and its own separately-named checkpoint/log/TensorBoard paths
+(`stage1_crop_resnet50*`), so running it can't clobber or interfere with §4's
+already-progressing run. Chaining Stage 1's output into Stage 2 (loading it
+as §4's starting point) is still not automated — flagged in the notebook as
+a manual follow-up, consistent with this plan's own explicit Stage 2
+scoping decision above. `--batch-size 4` is reused as-is from §4's recipe
+without re-measuring for the much lighter 512px crop workload — flagged in
+the notebook markdown as very likely overly conservative, worth raising once
+a first run confirms stability.
+
+Real-data verification of the fusion script (real MAGFiLO annotations, not
+synthetic) — same situation as everything else on this branch, the data
+isn't present locally.
