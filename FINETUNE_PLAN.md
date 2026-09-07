@@ -243,6 +243,27 @@ catches the exact class of bug §11 already found once for the ImageNet stem pat
   needs stopping from the ngrok dashboard directly — didn't guess an exact
   dashboard URL for that since it couldn't be confirmed against ngrok's own
   docs.
+- **A real run then trained 2 real epochs (val PQ 0.124 → 0.144, a genuine
+  improvement) and OOM-killed a DataLoader worker at the start of epoch 3**
+  (`DataLoader worker ... is killed by signal: Killed` — the Linux OOM
+  killer's signature, not a CUDA/VRAM OOM). Root cause: `val_loader` was
+  built from the exact same `loader_kwargs` as `train_loader`, including
+  `persistent_workers=True`. Validation only runs once per epoch, so those
+  workers had no reason to persist — but once rank 0 ran its first
+  validation pass (end of epoch 1), 4 more worker processes spawned and
+  then sat alive, holding pinned host memory, for the rest of the run.
+  Combined with rank 0's 4 persistent train workers and rank 1's 4 (DDP,
+  world_size=2), that's up to 12 concurrent worker processes at
+  `img_size=2048` — each decoding/augmenting a full native-resolution
+  image. The crash landing right after the *second* validation pass (not
+  the first) matches this cumulative-buildup explanation exactly. Fixed by
+  giving `val_loader` its own kwargs without `persistent_workers` — its
+  workers now get torn down after each validation pass and respawn fresh
+  next epoch, a small per-epoch cost against a real mid-run crash.
+  `--num-workers` itself is left unchanged (still 4) since this fix directly
+  targets the diagnosed cause rather than blindly lowering a knob without
+  evidence it's the one that matters — `configs/finetune_resnet50_kaggle.yaml`
+  now documents it as the next lever if host RAM OOMs recur regardless.
 - **A second bug found while re-testing the notebook after these additions**:
   `finetune_resnet50_kaggle.ipynb`'s dependency-install cell had `\\b` (two
   literal backslashes) instead of `\b` (a regex word boundary) in its

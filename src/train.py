@@ -361,7 +361,20 @@ def main() -> None:
     else:
         train_sampler = None
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **loader_kwargs)  # rank 0 only, full val set
+    # Deliberately NOT loader_kwargs (i.e. NOT persistent_workers) -- validation
+    # only runs once per epoch on rank 0, so persistent workers here just sit
+    # idle (still holding pinned host memory) between validation passes instead
+    # of being torn down. At img_size=2048 under DDP, this was directly
+    # responsible for a real OOM: with --num-workers 4, persistent_workers=True
+    # on val_loader meant rank 0 accumulated 4 train + 4 val workers (8 total)
+    # after the first validation pass, on top of rank 1's 4 train workers (12
+    # concurrent worker processes total) -- confirmed by the crash landing right
+    # after the second validation pass, killed by the OOM killer
+    # ("DataLoader worker ... is killed by signal: Killed"). Ephemeral workers
+    # here (torn down after each validation pass) cost a small per-epoch
+    # respawn latency, which is a much better trade than an OOM mid-run.
+    val_loader_kwargs = {"num_workers": args.num_workers, "pin_memory": pin_memory}
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **val_loader_kwargs)  # rank 0 only, full val set
 
     if distributed and not is_main:
         dist.barrier()  # let rank 0 download+cache the pretrained encoder weights first, avoiding a concurrent-download race

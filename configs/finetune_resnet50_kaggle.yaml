@@ -57,7 +57,11 @@ train:
                        # batch_size further if a run OOMs -- same effective batch size,
                        # lower peak memory. See src/train.py's run_train_epoch docstring.
   early_stopping_patience: 5  # stop if val PQ hasn't improved in 5 epochs -- 0 disables
-  num_workers: 4
+  num_workers: 4  # per-process under DDP (world_size=2 -> 8 concurrent train
+                  # workers total) -- if host RAM OOMs recur even with
+                  # src/train.py's val_loader persistent_workers fix, this is
+                  # the next lever to lower; each worker decodes/augments a full
+                  # 2048x2048 image, which is heavy at this resolution
   amp: auto  # mixed precision -- close to a requirement at this resolution on a T4's 16GB
   tensorboard_dir: outputs/tensorboard  # tunneled out live via ngrok, see
                                         # finetune_resnet50_kaggle.ipynb section 3.6
